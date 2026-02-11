@@ -3,7 +3,7 @@ version: '3.8'
 services:
   jellyfin-watch-tracker:
     image: ghcr.io/yourusername/jellyfin-watch-tracker:latest
-    container_name: jellyfin-watch-tracker
+    container_name: JellyWatchtracker
     restart: unless-stopped
     
     ports:
