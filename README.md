@@ -1,6 +1,10 @@
 # 🎬 Jellyfin Watch Tracker
 
-A beautiful, feature-rich web application for tracking your Jellyfin media watch history with advanced analytics, progress tracking, and TMDB integration.
+JellyWatchTracker is a self‑hosted web application that aggregates your watch history from Jellyfin, Sonarr and Radarr and wraps it in a modern
+dashboard.  It exposes a simple Flask API backed by JSON files and a single‑page web UI to help you explore your library, monitor viewing
+progress, discover genre and mood trends, and keep track of which shows and movies you’ve completed.  Features include collapsible progress
+sections, mood‑based recommendations, genre combos, detailed charts, mobile‑friendly design, manual progress controls and administrative
+tools to clear caches or rebuild insights.
 
 ![Version](https://img.shields.io/badge/version-1.0.0-blue.svg)
 ![License](https://img.shields.io/badge/license-GPL--3.0-green.svg)
