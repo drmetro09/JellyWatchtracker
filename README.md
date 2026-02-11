@@ -65,7 +65,7 @@ version: '3.8'
 
 services:
   jellyfin-watch-tracker:
-    image: your-dockerhub-username/jellyfin-watch-tracker:latest
+    image: ghcr.io/drmetro09/jellyfin-watch-tracker:latest
     container_name: jellyfin-watch-tracker
     restart: unless-stopped
     ports:
@@ -111,7 +111,7 @@ docker run -d \
   -e RADARR_URL=http://your-radarr-server:7878 \
   -e RADARR_API_KEY=your_radarr_api_key \
   --restart unless-stopped \
-  your-dockerhub-username/jellyfin-watch-tracker:latest
+  ghcr.io/drmetro09/jellyfin-watch-tracker:latest
 ```
 
 ---
@@ -133,12 +133,12 @@ Save this as a template in `/boot/config/plugins/dockerMan/templates-user/`:
 <?xml version="1.0"?>
 <Container version="2">
   <Name>JellyfinWatchTracker</Name>
-  <Repository>your-dockerhub-username/jellyfin-watch-tracker:latest</Repository>
+  <Repository>ghcr.io/drmetro09/jellyfin-watch-tracker:latest</Repository>
   <Registry>https://hub.docker.com/</Registry>
   <Network>bridge</Network>
   <Privileged>false</Privileged>
-  <Support>https://github.com/your-username/jellyfin-watch-tracker/issues</Support>
-  <Project>https://github.com/your-username/jellyfin-watch-tracker</Project>
+  <Support>https://github.com/drmetro09/jellyfin-watch-tracker/issues</Support>
+  <Project>https://github.com/drmetro09/jellyfin-watch-tracker</Project>
   <Overview>
     Beautiful web application for tracking Jellyfin watch history with advanced analytics, 
     progress tracking, and TMDB integration. Features include episode-level tracking, 
@@ -147,7 +147,7 @@ Save this as a template in `/boot/config/plugins/dockerMan/templates-user/`:
   <Category>MediaApp:Video MediaServer:Video Status:Stable</Category>
   <WebUI>http://[IP]:[PORT:5000]</WebUI>
   <TemplateURL/>
-  <Icon>https://raw.githubusercontent.com/your-username/jellyfin-watch-tracker/main/icon.png</Icon>
+  <Icon>https://raw.githubusercontent.com/drmetro09/jellyfin-watch-tracker/main/icon.png</Icon>
   <ExtraParams/>
   <PostArgs/>
   <CPUset/>
@@ -463,17 +463,24 @@ This project is licensed under the **GNU General Public License v3.0** - see the
 
 ## 📧 Support
 
-- 🐛 **Issues**: [GitHub Issues](https://github.com/your-username/jellyfin-watch-tracker/issues)
-- 💬 **Discussions**: [GitHub Discussions](https://github.com/your-username/jellyfin-watch-tracker/discussions)
-- 📖 **Wiki**: [Documentation](https://github.com/your-username/jellyfin-watch-tracker/wiki)
+- 🐛 **Issues**: [GitHub Issues](https://github.com/drmetro09/jellyfin-watch-tracker/issues)
+- 💬 **Discussions**: [GitHub Discussions](https://github.com/drmetro09/jellyfin-watch-tracker/discussions)
+- 📖 **Wiki**: [Documentation](https://github.com/drmetro09/jellyfin-watch-tracker/wiki)
 
 ---
+---
+
+## 🤖 AI-Generated Disclaimer
+
+This entire project was **vibe-coded** with AI assistance. It works great for my use case, but your mileage may vary. Code reviews, refactoring suggestions, and bug reports are not just welcome—they're encouraged! 🚀
+
+Built with ☕ + 🤖 + 💾
 
 ## ⭐ Star History
 
 If you find this project useful, please consider giving it a star!
 
-[![Star History Chart](https://api.star-history.com/svg?repos=your-username/jellyfin-watch-tracker&type=Date)](https://star-history.com/#your-username/jellyfin-watch-tracker&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=your-drmetro09/jellyfin-watch-tracker&type=Date)](https://star-history.com/#your-username/jellyfin-watch-tracker&Date)
 
 ---
 
