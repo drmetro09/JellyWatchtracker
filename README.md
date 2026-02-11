@@ -132,13 +132,13 @@ Save this as a template in `/boot/config/plugins/dockerMan/templates-user/`:
 ```xml
 <?xml version="1.0"?>
 <Container version="2">
-  <Name>JellyfinWatchTracker</Name>
+  <Name>JellyWatchTracker</Name>
   <Repository>ghcr.io/drmetro09/jellyfin-watch-tracker:latest</Repository>
   <Registry>https://hub.docker.com/</Registry>
   <Network>bridge</Network>
   <Privileged>false</Privileged>
-  <Support>https://github.com/drmetro09/jellyfin-watch-tracker/issues</Support>
-  <Project>https://github.com/drmetro09/jellyfin-watch-tracker</Project>
+  <Support>https://github.com/drmetro09/JellyWatchtracker/issues</Support>
+  <Project>https://github.com/drmetro09/JellyfinWatchtracker</Project>
   <Overview>
     Beautiful web application for tracking Jellyfin watch history with advanced analytics, 
     progress tracking, and TMDB integration. Features include episode-level tracking, 
@@ -147,7 +147,7 @@ Save this as a template in `/boot/config/plugins/dockerMan/templates-user/`:
   <Category>MediaApp:Video MediaServer:Video Status:Stable</Category>
   <WebUI>http://[IP]:[PORT:5000]</WebUI>
   <TemplateURL/>
-  <Icon>https://raw.githubusercontent.com/drmetro09/jellyfin-watch-tracker/main/icon.png</Icon>
+  <Icon>https://raw.githubusercontent.com/drmetro09/JellyWatchtracker/main/icon.png</Icon>
   <ExtraParams/>
   <PostArgs/>
   <CPUset/>
@@ -355,14 +355,14 @@ curl http://localhost:5000/api/export_csv > backup.csv
 
 ```bash
 # Clone repository
-git clone https://github.com/drmetro09/jellyfin-watch-tracker.git
-cd jellyfin-watch-tracker
+git clone https://github.com/drmetro09/JellyWatchtracker.git
+cd JellyWatchtracker/docker
 
 # Build Docker image
-docker build -t jellyfin-watch-tracker .
+docker build -t JellyfinWatchtracker .
 
 # Run locally
-docker run -p 5000:5000 -v $(pwd)/data:/data jellyfin-watch-tracker
+docker run -p 5000:5000 -v $(pwd)/data:/data JellyfinWatchtracker
 ```
 
 ### Local Development (without Docker)
@@ -410,7 +410,7 @@ Toggle in header toolbar!
 **Jellyfin import stuck:**
 - Check API key validity
 - Verify Jellyfin URL is accessible
-- Check Docker logs: `docker logs jellyfin-watch-tracker`
+- Check Docker logs: `docker logs JellyWatchTracker`
 
 **Missing posters:**
 - Verify TMDB API key is set
@@ -431,7 +431,7 @@ Toggle in header toolbar!
 
 **High memory usage:**
 - Reduce cache sizes in `data/` directory
-- Restart container: `docker restart jellyfin-watch-tracker`
+- Restart container: `docker restart JellyWatchTracker`
 
 ---
 
