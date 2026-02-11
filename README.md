@@ -355,7 +355,7 @@ curl http://localhost:5000/api/export_csv > backup.csv
 
 ```bash
 # Clone repository
-git clone https://github.com/your-username/jellyfin-watch-tracker.git
+git clone https://github.com/drmetro09/jellyfin-watch-tracker.git
 cd jellyfin-watch-tracker
 
 # Build Docker image
@@ -377,7 +377,7 @@ export JELLYFIN_API_KEY=your_key
 export TMDB_API_KEY=your_key
 
 # Run application
-python app.py
+python watch_tracker.py
 ```
 
 ---
