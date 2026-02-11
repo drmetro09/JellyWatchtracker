@@ -1,0 +1,47 @@
+version: '3.8'
+
+services:
+  jellyfin-watch-tracker:
+    image: ghcr.io/yourusername/jellyfin-watch-tracker:latest
+    container_name: jellyfin-watch-tracker
+    restart: unless-stopped
+    
+    ports:
+      - "5000:5000"
+    
+    volumes:
+      # Persistent data storage
+      - ./data:/data
+      # Optional: Custom posters directory
+      - ./data/custom_posters:/data/custom_posters
+    
+    environment:
+      # Jellyfin Configuration (Required)
+      - JELLYFIN_URL=http://jellyfin:8096
+      - JELLYFIN_API_KEY=your_jellyfin_api_key_here
+      
+      # TMDB Configuration (Highly Recommended for posters/metadata)
+      - TMDB_API_KEY=your_tmdb_api_key_here
+      
+      # Sonarr Configuration (Optional)
+      - SONARR_URL=http://sonarr:8989
+      - SONARR_API_KEY=your_sonarr_api_key_here
+      
+      # Radarr Configuration (Optional)
+      - RADARR_URL=http://radarr:7878
+      - RADARR_API_KEY=your_radarr_api_key_here
+    
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/api/history"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    
+    networks:
+      - media-network
+
+networks:
+  media-network:
+    name: media-network
+    driver: bridge
