@@ -463,9 +463,9 @@ This project is licensed under the **GNU General Public License v3.0** - see the
 
 ## 📧 Support
 
-- 🐛 **Issues**: [GitHub Issues](https://github.com/drmetro09/jellyfin-watch-tracker/issues)
-- 💬 **Discussions**: [GitHub Discussions](https://github.com/drmetro09/jellyfin-watch-tracker/discussions)
-- 📖 **Wiki**: [Documentation](https://github.com/drmetro09/jellyfin-watch-tracker/wiki)
+- 🐛 **Issues**: [GitHub Issues](https://github.com/drmetro09/JellyWatchtracker/issues)
+- 💬 **Discussions**: [GitHub Discussions](https://github.com/drmetro09/JellyWatchtracker/discussions)
+- 📖 **Wiki**: [Documentation](https://github.com/drmetro09/JellyWatchtracker/wiki)
 
 ---
 ---
