@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, send_file, Response
 from datetime import datetime, timedelta
 import json
 import os
@@ -6,14 +6,33 @@ from collections import Counter, defaultdict
 import io
 import requests
 import traceback
+from concurrent.futures import ThreadPoolExecutor
+import threading
 from werkzeug.utils import secure_filename
 import csv
 import time
 import re
 import unicodedata
+from difflib import SequenceMatcher
 import requests
 
 app = Flask(__name__)
+
+@app.after_request
+def add_no_cache_headers(response):
+    """
+    Prevent stale HTML/JS/API responses in browsers and service-worker caches.
+    This avoids running old frontend code after backend updates.
+    """
+    try:
+        p = request.path or ""
+        if p == "/" or p == "/sw.js" or p == "/manifest.json" or p.startswith("/api/"):
+            response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+            response.headers["Pragma"] = "no-cache"
+            response.headers["Expires"] = "0"
+    except Exception:
+        pass
+    return response
 
 DATA_FILE = "/data/watch_history.json"
 POSTER_DIR = "/data/custom_posters"
@@ -28,9 +47,346 @@ RADARR_API_KEY = os.getenv("RADARR_API_KEY", "")
 cache = {"data": None, "time": None}
 poster_cache = {}
 series_cache = {}
+# Track one-time TMDB retries for shows that previously failed
+tmdb_retry = set()
 custom_posters = {}
 manual_complete = {}
 season_complete = {}
+genre_insights_cache = {"sig": None, "data": None}
+history_sig_fast = None
+genre_recs_cache = {"sig": None, "top_genre": None, "ts": 0, "movies": [], "shows": []}
+_prewarm_lock = threading.Lock()
+_prewarm_busy = False
+_tmdb_prewarm_lock = threading.Lock()
+_tmdb_prewarm_busy = False
+realtime_seq = 0
+realtime_cv = threading.Condition()
+webhook_recent = {}
+webhook_recent_lock = threading.Lock()
+WEBHOOK_DEDUPE_SECONDS = 20
+TMDB_TOUCH_FILE = "/data/tmdb_touch.txt"
+_tmdb_touch_lock = threading.Lock()
+_tmdb_touch_timer = None
+_tmdb_pending_lock = threading.Lock()
+_tmdb_pending_posters = set()
+_tmdb_pending_series = set()
+_tmdb_executor = ThreadPoolExecutor(max_workers=4)
+
+def _strip_year_suffix(name):
+    s = str(name or "").strip()
+    m = re.search(r"\s*\((\d{4})\)\s*$", s)
+    return (s[:m.start()].strip() if m else s)
+
+def _update_show_totals_from_tmdb(series_name, expected_year, series_info):
+    """
+    Persist TMDB total-episode counts so /api/history can stay cache-only (fast)
+    while still showing correct watched/total for shows.
+    """
+    try:
+        if not isinstance(series_info, dict):
+            return
+        total_all = _coerce_int(series_info.get("total_episodes_in_series"), 0) or 0
+        if total_all <= 0:
+            return
+
+        seasons_meta = series_info.get("seasons", {}) or {}
+        season_map = {}
+        if isinstance(seasons_meta, dict):
+            for snum, meta in seasons_meta.items():
+                try:
+                    sn = _coerce_int(snum, None)
+                except Exception:
+                    sn = None
+                if sn is None or sn <= 0:
+                    continue
+                if isinstance(meta, dict):
+                    st = _coerce_int(meta.get("total_episodes"), 0) or 0
+                else:
+                    st = _coerce_int(meta, 0) or 0
+                if st > 0:
+                    season_map[str(sn)] = st
+
+        # Store under a few safe aliases to survive webhook naming differences.
+        raw = str(series_name or "").strip()
+        base = _strip_year_suffix(raw)
+        aliases = []
+        for n in (raw, base):
+            if not n:
+                continue
+            aliases.extend([n, n.lower(), _norm_title(n)])
+
+        payload = load_json_file(SHOW_TOTALS_FILE)
+        if not isinstance(payload, dict):
+            payload = {}
+
+        changed = False
+        for key in aliases:
+            if not key:
+                continue
+            cur = payload.get(key)
+            if not isinstance(cur, dict):
+                cur = {"total": 0, "seasons": {}}
+            cur_total = _coerce_int(cur.get("total"), 0) or 0
+            if total_all > cur_total:
+                cur["total"] = total_all
+                changed = True
+            cur_seasons = cur.get("seasons")
+            if not isinstance(cur_seasons, dict):
+                cur_seasons = {}
+                cur["seasons"] = cur_seasons
+            for sn, st in season_map.items():
+                prev = _coerce_int(cur_seasons.get(sn), 0) or 0
+                if st > prev:
+                    cur_seasons[sn] = st
+                    changed = True
+            payload[key] = cur
+
+        if changed:
+            save_json_file(SHOW_TOTALS_FILE, payload)
+    except Exception:
+        pass
+
+def _file_sig(path):
+    try:
+        st = os.stat(path)
+        return f"{st.st_mtime_ns}:{st.st_size}"
+    except Exception:
+        return "0"
+
+def _data_signature():
+    return "|".join([
+        _file_sig(DATA_FILE),
+        _file_sig(RATINGS_FILE),
+        _file_sig("/data/manual_complete.json"),
+        _file_sig("/data/season_complete.json"),
+        _file_sig("/data/custom_posters.json"),
+        _file_sig(SHOW_TOTALS_FILE),
+        _file_sig(TMDB_TOUCH_FILE),
+    ])
+
+def _touch_tmdb_cache_and_notify():
+    """
+    Touch a small marker file so the UI can re-render after poster/series caches
+    are rebuilt, without including the full cache files in the data signature.
+    """
+    try:
+        os.makedirs("/data", exist_ok=True)
+        with open(TMDB_TOUCH_FILE, "w") as f:
+            f.write(str(time.time_ns()))
+    except Exception:
+        pass
+    # Invalidate the organized cache and notify clients.
+    try:
+        cache["time"] = None
+        cache["sig"] = None
+    except Exception:
+        pass
+    refresh_history_sig_fast()
+
+def _schedule_tmdb_touch(delay_s=1.5):
+    global _tmdb_touch_timer
+    try:
+        with _tmdb_touch_lock:
+            if _tmdb_touch_timer and _tmdb_touch_timer.is_alive():
+                return
+            t = threading.Timer(delay_s, _touch_tmdb_cache_and_notify)
+            t.daemon = True
+            _tmdb_touch_timer = t
+            t.start()
+    except Exception:
+        pass
+
+def _queue_tmdb_poster_fetch(title, year=None, media_type="movie"):
+    if not TMDB_API_KEY:
+        return
+    try:
+        key = f"{media_type}_{title}_{year}".lower()
+        cached = poster_cache.get(key)
+        if isinstance(cached, str) and cached:
+            return
+        if isinstance(cached, dict) and cached.get("url"):
+            return
+        with _tmdb_pending_lock:
+            if key in _tmdb_pending_posters:
+                return
+            _tmdb_pending_posters.add(key)
+
+        def _run():
+            try:
+                get_tmdb_poster(title, year, media_type, allow_network=True)
+            finally:
+                with _tmdb_pending_lock:
+                    _tmdb_pending_posters.discard(key)
+                _schedule_tmdb_touch()
+
+        _tmdb_executor.submit(_run)
+    except Exception:
+        return
+
+def _queue_tmdb_series_fetch(series_name, expected_year=None):
+    if not TMDB_API_KEY:
+        return
+    try:
+        skey = f"{str(series_name or '').strip().lower()}|{str(expected_year or '')}"
+        with _tmdb_pending_lock:
+            if skey in _tmdb_pending_series:
+                return
+            _tmdb_pending_series.add(skey)
+
+        def _run():
+            try:
+                # Webhooks often provide episode-year values, and transient TMDB failures
+                # shouldn't pin a show to "fetching..." for hours. Try multiple lookups:
+                # 1) year-hinted (if provided)
+                # 2) yearless (title-only)
+                # 3) forced refresh yearless to bypass stale negative caches
+                info = get_tmdb_series_info(series_name, expected_year=expected_year, allow_network=True)
+                if not info and expected_year is not None:
+                    info = get_tmdb_series_info(series_name, expected_year=None, allow_network=True)
+                if not info:
+                    info = get_tmdb_series_info(series_name, expected_year=None, force_refresh=True, allow_network=True)
+                if info:
+                    _update_show_totals_from_tmdb(series_name, expected_year, info)
+            finally:
+                with _tmdb_pending_lock:
+                    _tmdb_pending_series.discard(skey)
+                _schedule_tmdb_touch()
+
+        _tmdb_executor.submit(_run)
+    except Exception:
+        return
+
+def prewarm_tmdb_cache_async(limit_posters=200, limit_series=150, force=False):
+    global _tmdb_prewarm_busy
+    if not TMDB_API_KEY:
+        return
+    with _tmdb_prewarm_lock:
+        if _tmdb_prewarm_busy and not force:
+            return
+        _tmdb_prewarm_busy = True
+
+    def _run():
+        global _tmdb_prewarm_busy
+        try:
+            org = {}
+            try:
+                # organize_data() is fast now (cache-only TMDB reads).
+                org = organize_data() or {}
+            except Exception:
+                org = {}
+
+            posters = 0
+            series = 0
+
+            for m in (org.get("movies") or []):
+                if posters >= limit_posters:
+                    break
+                if not m:
+                    continue
+                if not m.get("poster"):
+                    _queue_tmdb_poster_fetch(m.get("name"), m.get("year"), "movie")
+                    posters += 1
+
+            for s in (org.get("shows") or []):
+                if posters < limit_posters and not s.get("poster"):
+                    _queue_tmdb_poster_fetch(s.get("series_name"), s.get("year"), "tv")
+                    posters += 1
+                if series >= limit_series:
+                    continue
+                # When forced (e.g. after clearing TMDB cache), always rebuild series info.
+                # Otherwise, rebuild only when we don't have reliable totals yet.
+                total_watched = _coerce_int(s.get("total_episodes"), 0) or 0
+                total_possible = _coerce_int(s.get("total_episodes_possible"), 0) or 0
+                looks_inferred = (
+                    (total_watched > 0 and total_possible <= 0) or
+                    (total_possible > 0 and total_watched > 0 and total_possible <= total_watched)
+                )
+                if force or (not s.get("has_tmdb_data")) or looks_inferred:
+                    # Stored "year" for episode records is often the episode year, not the series start year.
+                    # Passing it here can cause mismatches and prolonged negative caching.
+                    _queue_tmdb_series_fetch(s.get("series_name"), expected_year=None)
+                    series += 1
+        finally:
+            with _tmdb_prewarm_lock:
+                _tmdb_prewarm_busy = False
+
+    threading.Thread(target=_run, daemon=True).start()
+
+# === New files and constants for advanced features ===
+# Ratings storage file. Each entry keyed by unique item identifier (e.g., "movie|Inception|2010").
+RATINGS_FILE = "/data/ratings.json"
+# Action history file for undo functionality. Stores the last 20 actions performed that can be undone.
+ACTION_HISTORY_FILE = "/data/action_history.json"
+# User preferences file used to persist theme/layout selections across devices.
+PREFERENCES_FILE = "/data/user_preferences.json"
+SHOW_TOTALS_FILE = "/data/show_totals_cache.json"
+
+def load_json_file(path):
+    """
+    Helper to load a JSON file. Returns an empty dict if the file does not exist
+    or cannot be parsed.
+    """
+    try:
+        if os.path.exists(path):
+            with open(path) as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+def save_json_file(path, data):
+    """
+    Helper to save a dictionary to a JSON file. Fails silently on error.
+    """
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(data, f)
+        refresh_history_sig_fast()
+    except Exception:
+        pass
+
+def load_ratings():
+    """
+    Load ratings from RATINGS_FILE. Returns a dict mapping item keys to rating info.
+    """
+    return load_json_file(RATINGS_FILE)
+
+def save_ratings(ratings):
+    """
+    Save ratings dictionary to RATINGS_FILE.
+    """
+    save_json_file(RATINGS_FILE, ratings)
+
+def load_action_history():
+    """
+    Load the action history list from ACTION_HISTORY_FILE. The file stores a dict
+    with key 'history' mapping to a list of actions.
+    """
+    data = load_json_file(ACTION_HISTORY_FILE)
+    return data.get("history", []) if isinstance(data, dict) else []
+
+def save_action_history(history):
+    """
+    Save the provided history list to ACTION_HISTORY_FILE under key 'history'.
+    """
+    save_json_file(ACTION_HISTORY_FILE, {"history": history})
+
+def record_action(action_type, payload):
+    """
+    Append a new action to the history. Keeps only the last 20 actions.
+
+    :param action_type: string identifier for the action (e.g. 'delete_movie')
+    :param payload: dict containing the information needed to undo the action
+    """
+    try:
+        history = load_action_history()
+        history.append({"type": action_type, "payload": payload, "timestamp": datetime.now().isoformat()})
+        # keep only last 20 actions
+        history = history[-20:]
+        save_action_history(history)
+    except Exception as e:
+        print(f"Failed to record action: {e}")
 
 
 def load_caches():
@@ -72,6 +428,10 @@ def save_cache(cache_type):
         elif cache_type == "season_complete":
             with open("/data/season_complete.json", "w") as f:
                 json.dump(season_complete, f)
+        # Poster/series TMDB caches are derived metadata and should not trigger
+        # full history refresh churn in the UI.
+        if cache_type in ("custom", "complete", "season_complete"):
+            refresh_history_sig_fast()
     except Exception as e:
         print(f"Cache save error: {e}")
 
@@ -99,7 +459,117 @@ def _score_title(qn: str, cn: str) -> int:
     return hit * 10 + bonus
 
 
-def get_tmdb_poster(title, year=None, media_type="movie"):
+def _coerce_int(value, default=None):
+    """
+    Best-effort integer parser for values that may be numeric strings like
+    "5", "5.0", "E5" or "S1E5". Returns `default` when parsing fails.
+    """
+    try:
+        if isinstance(value, bool):
+            return default
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            return int(value)
+        s = str(value).strip()
+        if not s:
+            return default
+        if re.fullmatch(r"-?\d+", s):
+            return int(s)
+        if re.fullmatch(r"-?\d+\.\d+", s):
+            return int(float(s))
+        m = re.search(r"-?\d+", s)
+        if m:
+            return int(m.group(0))
+    except Exception:
+        pass
+    return default
+
+
+def _normalize_genres(value):
+    """
+    Normalize genre inputs to a de-duplicated list of non-empty strings.
+    Supports list/tuple/set, comma/pipe separated strings, and JSON-like arrays.
+    """
+    items = []
+    if isinstance(value, (list, tuple, set)):
+        items = list(value)
+    elif isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return []
+        if raw.startswith("[") and raw.endswith("]"):
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, list):
+                    items = parsed
+                else:
+                    items = [raw]
+            except Exception:
+                items = [raw]
+        else:
+            items = re.split(r"[|,;/]", raw)
+    elif value is None:
+        return []
+    else:
+        items = [value]
+
+    out = []
+    seen = set()
+    for g in items:
+        try:
+            genre = str(g or "").strip()
+        except Exception:
+            genre = ""
+        if not genre:
+            continue
+        key = genre.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(genre)
+    return out
+
+
+def _is_duplicate_webhook_event(event_key):
+    try:
+        now = time.time()
+        with webhook_recent_lock:
+            last = webhook_recent.get(event_key)
+            webhook_recent[event_key] = now
+            # Keep the dedupe map bounded.
+            if len(webhook_recent) > 1024:
+                cutoff = now - (WEBHOOK_DEDUPE_SECONDS * 3)
+                stale = [k for k, ts in webhook_recent.items() if ts < cutoff]
+                for k in stale:
+                    webhook_recent.pop(k, None)
+        return bool(last and (now - float(last)) < WEBHOOK_DEDUPE_SECONDS)
+    except Exception:
+        return False
+
+def notify_realtime_change():
+    global realtime_seq
+    try:
+        with realtime_cv:
+            realtime_seq += 1
+            realtime_cv.notify_all()
+    except Exception:
+        pass
+
+def refresh_history_sig_fast():
+    """
+    Keep a cheap in-memory signature for /api/history_sig so frequent polls do
+    not need to stat multiple files each time.
+    """
+    global history_sig_fast
+    try:
+        history_sig_fast = _data_signature()
+    except Exception:
+        history_sig_fast = str(time.time_ns())
+    notify_realtime_change()
+
+
+def get_tmdb_poster(title, year=None, media_type="movie", allow_network=True):
     """
     FIXED version with year stripping and better TV show support
     """
@@ -142,6 +612,10 @@ def get_tmdb_poster(title, year=None, media_type="movie"):
             poster_cache[key] = {"url": None, "ts": now}
             save_cache("poster")
             return None
+
+    if not allow_network:
+        # Fast-path for UI responsiveness: don't block history rendering on TMDB.
+        return None
 
     # ---- TMDB helper ----
     def tmdb_get(url, params):
@@ -224,114 +698,264 @@ def get_tmdb_poster(title, year=None, media_type="movie"):
     return poster_url
 
     
-def get_tmdb_series_info(series_name, force_refresh=False):
+def get_tmdb_series_info(series_name, expected_year=None, force_refresh=False, allow_network=True):
     if not TMDB_API_KEY:
         return None
-    
-    if not force_refresh and series_name in series_cache:
-        cached = series_cache.get(series_name)
-        if cached:
+
+    raw_name = str(series_name or "").strip()
+    search_name = raw_name
+    try:
+        expected_year = _coerce_int(expected_year, None)
+    except Exception:
+        expected_year = None
+    if raw_name:
+        try:
+            m = re.search(r"\((\d{4})\)\s*$", raw_name)
+            if m:
+                if expected_year is None:
+                    expected_year = int(m.group(1))
+                search_name = raw_name[:m.start()].strip() or raw_name
+        except Exception:
+            search_name = raw_name
+
+    now = int(time.time())
+    # Negative cache TTL: keep relatively short so background rebuilds can recover
+    # from mismatches (especially when webhooks provide episode-year values).
+    NEG_TTL = 2 * 3600
+
+    # Versioned key to invalidate older TMDB series-cache structures.
+    cache_key = f"v3|{search_name}|{expected_year}" if expected_year else f"v3|{search_name}"
+
+    def _is_neg(v):
+        return isinstance(v, dict) and v.get("_neg") is True
+
+    # If we don't have an expected year, and we have exactly one cached year-specific
+    # match for this title, use it to avoid drifting between similarly-named shows.
+    if not force_refresh and expected_year is None and cache_key not in series_cache:
+        try:
+            prefix = f"v3|{search_name}|"
+            candidates = []
+            for k, v in series_cache.items():
+                if not isinstance(k, str) or not k.startswith(prefix):
+                    continue
+                if v is None:
+                    continue
+                if _is_neg(v):
+                    ts = int(v.get("ts") or 0)
+                    if ts and (now - ts) < NEG_TTL:
+                        continue
+                if isinstance(v, dict) and v.get("tmdb_id"):
+                    candidates.append(v)
+            if len(candidates) == 1:
+                # Store an alias for future yearless lookups
+                series_cache[cache_key] = candidates[0]
+                save_cache("series")
+                return candidates[0]
+        except Exception:
+            pass
+
+    if not force_refresh and cache_key in series_cache:
+        cached = series_cache.get(cache_key)
+        if cached and not _is_neg(cached):
             return cached
         elif cached is None:
-            return None
-    
+            # Legacy negative cache entry (no timestamp). Treat as expired so
+            # we can retry in the future instead of permanently resetting totals.
+            pass
+        elif _is_neg(cached):
+            try:
+                ts = int(cached.get("ts") or 0)
+                if ts and (now - ts) < NEG_TTL:
+                    # A year-specific negative should not block a valid yearless alias.
+                    # This is important when webhooks supply episode-year values.
+                    if expected_year is not None:
+                        try:
+                            alias_key = f"v3|{search_name}"
+                            cached_alias = series_cache.get(alias_key)
+                            if cached_alias and not _is_neg(cached_alias):
+                                return cached_alias
+                        except Exception:
+                            pass
+                    return None
+            except Exception:
+                return None
+    # If we have an expected year but only a yearless alias is cached, use it.
+    if not force_refresh and expected_year is not None:
+        try:
+            alias_key = f"v3|{search_name}"
+            cached_alias = series_cache.get(alias_key)
+            if cached_alias and not _is_neg(cached_alias):
+                return cached_alias
+        except Exception:
+            pass
+
+    def _norm(title):
+        if not title:
+            return ""
+        t = unicodedata.normalize("NFKD", str(title))
+        t = "".join(ch for ch in t if not unicodedata.combining(ch))
+        t = re.sub(r"[^a-zA-Z0-9]+", " ", t).strip().lower()
+        return re.sub(r"\s+", " ", t)
+
     try:
+        base_name = _norm(search_name)
         search_queries = [
-            series_name,
-            series_name.replace(":", ""),
-            series_name.replace("-", " "),
-            series_name.replace("'", ""),
-            series_name.split(":")[0].strip() if ":" in series_name else series_name,
+            search_name,
+            search_name.replace(":", ""),
+            search_name.replace("-", " "),
+            search_name.replace("'", ""),
+            search_name.split(":")[0].strip() if ":" in search_name else search_name,
         ]
-        
+
         best_result = None
-        best_score = 0
-        
+        best_score = -1.0
+
+        if not allow_network:
+            # Fast-path for UI responsiveness: don't block history rendering on TMDB.
+            # Cache reads are handled above; if we get here we have no usable cached hit.
+            return None
+
         for query in search_queries:
-            if not query.strip():
+            q = (query or "").strip()
+            if not q:
                 continue
-                
+
             r = requests.get(
                 "https://api.themoviedb.org/3/search/tv",
-                params={"api_key": TMDB_API_KEY, "query": query, "language": "en-US"},
-                timeout=10
+                params={"api_key": TMDB_API_KEY, "query": q, "language": "en-US"},
+                timeout=10,
             )
-            
+
             if r.status_code != 200:
                 continue
-            
-            data = r.json()
+
+            data = r.json() or {}
             results = data.get("results", [])
-            
-            if results and len(results) > 0:
-                for result in results[:10]:
-                    result_name = result.get("name", "").lower()
-                    query_lower = query.lower()
-                    
-                    if result_name == query_lower:
-                        best_result = result
-                        best_score = 100
-                        break
-                    
-                    if query_lower in result_name or result_name in query_lower:
-                        score = 50
-                        if score > best_score:
-                            best_result = result
-                            best_score = score
-                
-                if best_score == 100:
-                    break
-        
-        if not best_result:
-            series_cache[series_name] = None
+
+            for result in results[:20]:
+                result_name_raw = result.get("name", "")
+                result_name = _norm(result_name_raw)
+                if not result_name:
+                    continue
+
+                original_name = _norm(result.get("original_name", ""))
+                score_name = SequenceMatcher(None, base_name, result_name).ratio() * 100
+                if original_name:
+                    score_name = max(score_name, SequenceMatcher(None, base_name, original_name).ratio() * 100)
+                score = score_name
+
+                if result_name == base_name or original_name == base_name:
+                    score += 40
+                elif result_name.startswith(base_name) or base_name.startswith(result_name) or (
+                    original_name and (original_name.startswith(base_name) or base_name.startswith(original_name))
+                ):
+                    score += 20
+                elif base_name and (base_name in result_name or result_name in base_name):
+                    score += 10
+
+                first_air_date = result.get("first_air_date") or ""
+                result_year = None
+                if isinstance(first_air_date, str) and len(first_air_date) >= 4:
+                    try:
+                        result_year = int(first_air_date[:4])
+                    except Exception:
+                        result_year = None
+                if expected_year and result_year:
+                    diff = abs(expected_year - result_year)
+                    if diff == 0:
+                        score += 35
+                    elif diff == 1:
+                        score += 24
+                    elif diff <= 3:
+                        score += 12 - (diff * 2)
+                    else:
+                        # Avoid huge penalties; webhooks sometimes provide episode-year,
+                        # which would otherwise cause correct matches to be rejected.
+                        score -= min(10, diff * 2)
+                elif expected_year and not result_year:
+                    score -= 5
+
+                popularity = result.get("popularity", 0) or 0
+                try:
+                    score += min(float(popularity) / 10.0, 20.0)
+                except Exception:
+                    pass
+
+                vote_count = result.get("vote_count", 0) or 0
+                try:
+                    score += min(float(vote_count) / 200.0, 15.0)
+                except Exception:
+                    pass
+
+                if score > best_score:
+                    best_score = score
+                    best_result = result
+
+        if not best_result or best_score < 30:
+            series_cache[cache_key] = {"_neg": True, "ts": now}
             save_cache("series")
             return None
-        
+
         tv_id = best_result.get("id")
-        
+
         r2 = requests.get(
             f"https://api.themoviedb.org/3/tv/{tv_id}",
             params={"api_key": TMDB_API_KEY, "language": "en-US"},
-            timeout=10
+            timeout=10,
         )
-        
+
         if r2.status_code != 200:
-            series_cache[series_name] = None
+            series_cache[cache_key] = None
             save_cache("series")
             return None
-        
-        detail = r2.json()
+
+        detail = r2.json() or {}
         seasons_info = {}
-        total_all_episodes = 0
-        
+        total_all_episodes = _coerce_int(detail.get("number_of_episodes"), 0) or 0
+
         seasons = detail.get("seasons", [])
+        summed_regular_seasons = 0
         for season in seasons:
             snum = season.get("season_number")
             ep_count = season.get("episode_count", 0)
-            
+
             if snum is not None and snum > 0:
                 seasons_info[snum] = {
                     "total_episodes": ep_count,
-                    "name": season.get("name", f"Season {snum}")
+                    "name": season.get("name", f"Season {snum}"),
                 }
-                total_all_episodes += ep_count
-        
+                try:
+                    summed_regular_seasons += int(ep_count or 0)
+                except Exception:
+                    pass
+
+        # Fallback if TMDB does not provide number_of_episodes reliably.
+        if total_all_episodes <= 0:
+            total_all_episodes = summed_regular_seasons
+
         info = {
             "seasons": seasons_info,
             "total_episodes_in_series": total_all_episodes,
             "tmdb_name": best_result.get("name", ""),
-            "tmdb_id": tv_id
+            "tmdb_id": tv_id,
         }
-        
-        series_cache[series_name] = info
+
+        series_cache[cache_key] = info
+
+        # If this lookup was year-specific, also store a safe yearless alias when
+        # it doesn't conflict with an existing different TMDB id.
+        if expected_year is not None:
+            alias_key = f"v3|{search_name}"
+            existing = series_cache.get(alias_key)
+            if existing is None or _is_neg(existing) or (isinstance(existing, dict) and existing.get("tmdb_id") == tv_id):
+                series_cache[alias_key] = info
         save_cache("series")
         return info
-        
-    except Exception as e:
-        series_cache[series_name] = None
+
+    except Exception:
+        series_cache[cache_key] = {"_neg": True, "ts": now}
         save_cache("series")
         return None
-    
 
 def get_tmdb_episode_name(series_name, season_num, episode_num):
     if not TMDB_API_KEY:
@@ -424,8 +1048,12 @@ def save_all_records(records):
             f.write(json.dumps(record) + "\n")
         f.flush()
         os.fsync(f.fileno())
-    cache["data"] = None
+    # Keep the previous organized payload in memory so organize_data() can reuse
+    # totals (e.g. TMDB total episodes) during transient TMDB/cache failures.
+    # The signature change will still force a recompute.
     cache["time"] = None
+    cache["sig"] = None
+    refresh_history_sig_fast()
 
 
 def append_record(record):
@@ -434,8 +1062,31 @@ def append_record(record):
         f.write(json.dumps(record) + "\n")
         f.flush()
         os.fsync(f.fileno())
-    cache["data"] = None
+    # Keep the previous organized payload in memory so organize_data() can reuse
+    # totals (e.g. TMDB total episodes) during transient TMDB/cache failures.
+    # The signature change will still force a recompute.
     cache["time"] = None
+    cache["sig"] = None
+    refresh_history_sig_fast()
+
+def prewarm_organized_cache_async():
+    global _prewarm_busy
+    with _prewarm_lock:
+        if _prewarm_busy:
+            return
+        _prewarm_busy = True
+
+    def _run():
+        global _prewarm_busy
+        try:
+            organize_data()
+        except Exception:
+            pass
+        finally:
+            with _prewarm_lock:
+                _prewarm_busy = False
+
+    threading.Thread(target=_run, daemon=True).start()
 
 
 def calculate_watch_streak(records):
@@ -542,9 +1193,94 @@ def get_quick_stats(movies, shows, records):
 
 
 def organize_data():
-    if cache["data"] and cache["time"]:
-        if (datetime.now() - cache["time"]).total_seconds() < 3:
+    try:
+        sig = _data_signature()
+        if cache.get("data") and cache.get("sig") == sig:
             return cache["data"]
+    except Exception:
+        sig = None
+
+    prev_show_totals = {}
+    prev_season_totals = {}
+    # Persisted totals survive webhook-triggered cache invalidation and prevent
+    # temporary TMDB lookup failures from collapsing totals to watched-only.
+    try:
+        persisted_totals = load_json_file(SHOW_TOTALS_FILE)
+        if isinstance(persisted_totals, dict):
+            for series_name, meta in persisted_totals.items():
+                if not isinstance(meta, dict):
+                    continue
+                total_val = _coerce_int(meta.get("total"), 0) or 0
+                if total_val > 0:
+                    prev_show_totals[series_name] = max(prev_show_totals.get(series_name, 0), total_val)
+                seasons_meta = meta.get("seasons", {})
+                if not isinstance(seasons_meta, dict):
+                    continue
+                season_map = prev_season_totals.get(series_name, {})
+                for skey, sval in seasons_meta.items():
+                    snum = _coerce_int(skey, None)
+                    stotal = _coerce_int(sval, 0) or 0
+                    if snum and snum > 0 and stotal > 0:
+                        season_map[snum] = max(season_map.get(snum, 0), stotal)
+                if season_map:
+                    prev_season_totals[series_name] = season_map
+    except Exception:
+        pass
+
+    def _add_prev_show_aliases():
+        # Create tolerant lookup aliases for series names so minor webhook/title
+        # formatting differences don't reset totals (case/punct/year suffix).
+        try:
+            def _strip_year_suffix(n):
+                s = str(n or "").strip()
+                m = re.search(r"\s*\((\d{4})\)\s*$", s)
+                return (s[:m.start()].strip() if m else s)
+
+            show_items = list(prev_show_totals.items())
+            for raw_name, total in show_items:
+                raw = str(raw_name or "").strip()
+                if not raw:
+                    continue
+                stripped = _strip_year_suffix(raw)
+                norm_raw = _norm_title(raw)
+                norm_stripped = _norm_title(stripped)
+                for alias in (raw.lower(), stripped, stripped.lower(), norm_raw, norm_stripped):
+                    if alias and alias not in prev_show_totals:
+                        prev_show_totals[alias] = total
+                    if alias and raw_name in prev_season_totals and alias not in prev_season_totals:
+                        prev_season_totals[alias] = prev_season_totals.get(raw_name) or {}
+        except Exception:
+            pass
+
+    _add_prev_show_aliases()
+    try:
+        if cache.get("data") and isinstance(cache["data"], dict):
+            for s in cache["data"].get("shows", []) or []:
+                name = s.get("series_name")
+                if not name:
+                    continue
+                # Never treat watched-only counts as the series total. This was the
+                # source of the "1/1, 2/2" regression for brand-new shows.
+                if s.get("tmdb_pending"):
+                    continue
+                tp = _coerce_int(s.get("total_episodes_possible"), 0) or 0
+                tw = _coerce_int(s.get("total_episodes"), 0) or 0
+                if tp > 0 and (tp > tw or s.get("has_tmdb_data") or s.get("manually_completed")):
+                    prev_show_totals[name] = max(prev_show_totals.get(name, 0), tp)
+                st = prev_season_totals.get(name, {})
+                for season in s.get("seasons", []) or []:
+                    snum = season.get("season_number")
+                    if snum is None:
+                        continue
+                    stotal = _coerce_int(season.get("total_episodes"), 0) or 0
+                    if stotal > 0 and (season.get("has_tmdb_data") or s.get("has_tmdb_data") or s.get("manually_completed")):
+                        st[snum] = max(st.get(snum, 0), stotal)
+                if st:
+                    prev_season_totals[name] = st
+    except Exception:
+        pass
+    # Add aliases for any totals coming from the in-memory organized cache too.
+    _add_prev_show_aliases()
 
     records = get_all_records()
     movies = {}
@@ -554,6 +1290,7 @@ def organize_data():
 
     for r in records:
         rtype = r.get("type")
+        genres = _normalize_genres(r.get("genres", []))
         
         if rtype == "Movie":
             key = f"{r.get('name')}_{r.get('year')}"
@@ -563,12 +1300,15 @@ def organize_data():
                     "year": r.get("year"),
                     "watch_count": 0,
                     "watches": [],
-                    "genres": r.get("genres", []),
+                    "genres": genres,
                     "poster": None
                 }
+            elif genres:
+                merged = _normalize_genres((movies[key].get("genres") or []) + genres)
+                movies[key]["genres"] = merged
             movies[key]["watch_count"] += 1
             movies[key]["watches"].append({"timestamp": r.get("timestamp"), "user": r.get("user")})
-            for g in r.get("genres", []):
+            for g in genres:
                 genre_counter[g] += 1
 
         elif rtype == "Episode":
@@ -577,12 +1317,17 @@ def organize_data():
                 shows[series] = {
                     "series_name": series,
                     "seasons": {},
-                    "genres": r.get("genres", []),
+                    "genres": genres,
                     "poster": None,
                     "year": r.get("year")
                 }
+            elif not shows[series].get("year") and r.get("year"):
+                shows[series]["year"] = r.get("year")
+            if genres:
+                merged = _normalize_genres((shows[series].get("genres") or []) + genres)
+                shows[series]["genres"] = merged
             
-            season = r.get("season") or 0
+            season = _coerce_int(r.get("season"), 0) or 0
             
             if season == 999:
                 continue
@@ -591,7 +1336,9 @@ def organize_data():
                 shows[series]["seasons"][season] = {"season_number": season, "episodes": []}
             
             ep_list = shows[series]["seasons"][season]["episodes"]
-            ep_no = r.get("episode") or 0
+            ep_no = _coerce_int(r.get("episode"), 0) or 0
+            if ep_no <= 0:
+                continue
             
             found = False
             for ep in ep_list:
@@ -612,13 +1359,15 @@ def organize_data():
 
     for m in movies.values():
         if not m["poster"]:
-            m["poster"] = get_tmdb_poster(m["name"], m["year"], "movie")
+            # Don't block /api/history on TMDB network calls.
+            m["poster"] = get_tmdb_poster(m["name"], m["year"], "movie", allow_network=False)
         for g in m["genres"]:
             genre_breakdown[g]["movies"].append(m)
 
     for series_name, s in shows.items():
         if not s["poster"]:
-            s["poster"] = get_tmdb_poster(series_name, s.get("year"), "tv")
+            # Don't block /api/history on TMDB network calls.
+            s["poster"] = get_tmdb_poster(series_name, s.get("year"), "tv", allow_network=False)
         
         total_watched = 0
         seasons_list = []
@@ -645,21 +1394,125 @@ def organize_data():
             }
             
             seasons_list.append(season_obj)
+
+        observed_by_season = {}
+        for season in seasons_list:
+            snum = _coerce_int(season.get("season_number"), 0) or 0
+            if snum <= 0:
+                continue
+            mx = 0
+            for ep in season.get("episodes", []):
+                ep_no = _coerce_int(ep.get("episode"), 0) or 0
+                if ep_no > mx:
+                    mx = ep_no
+            if mx > 0:
+                observed_by_season[snum] = mx
+
+        def _tmdb_matches_observed(info):
+            if not info:
+                return False
+            seasons_meta = info.get("seasons", {})
+            if not observed_by_season:
+                return True
+            for snum, observed_max in observed_by_season.items():
+                meta = seasons_meta.get(snum)
+                if not meta:
+                    return False
+                tmdb_total = _coerce_int(meta.get("total_episodes"), 0) or 0
+                if tmdb_total < observed_max:
+                    return False
+            return True
         
         # Check if manually marked complete
         is_manually_complete = series_name in manual_complete
+        # Use tolerant lookup for totals (case + optional year suffix variants).
+        prev_total = 0
+        prev_seasons = {}
+        try:
+            candidates = [
+                str(series_name or "").strip(),
+                str(series_name or "").strip().lower(),
+                _norm_title(str(series_name or "").strip()),
+            ]
+            try:
+                m = re.search(r"\s*\((\d{4})\)\s*$", str(series_name or "").strip())
+                if m:
+                    base = str(series_name or "").strip()[:m.start()].strip()
+                    candidates.extend([base, base.lower(), _norm_title(base)])
+            except Exception:
+                pass
+            for k in candidates:
+                if not k:
+                    continue
+                v = _coerce_int(prev_show_totals.get(k), 0) or 0
+                if v > 0:
+                    prev_total = v
+                    prev_seasons = prev_season_totals.get(k) or {}
+                    break
+        except Exception:
+            prev_total = _coerce_int(prev_show_totals.get(series_name), 0) or 0
+            prev_seasons = prev_season_totals.get(series_name) or {}
         
         if is_manually_complete:
+            # Only use cached TMDB info here; never block /api/history on network.
+            series_info = None
+            if prev_total <= 0:
+                series_info = get_tmdb_series_info(series_name, expected_year=s.get("year"), allow_network=False)
+                if series_info and not _tmdb_matches_observed(series_info):
+                    series_info = None
+
+            total_possible = total_watched
+            has_tmdb = False
+            if series_info and series_info.get("total_episodes_in_series", 0) > 0:
+                total_possible = series_info["total_episodes_in_series"]
+                has_tmdb = True
+                for season in seasons_list:
+                    snum = season.get("season_number")
+                    if snum in series_info.get("seasons", {}):
+                        tmdb_total = series_info["seasons"][snum]["total_episodes"]
+                        observed_max = observed_by_season.get(snum, 0)
+                        prev_season_total = _coerce_int(prev_seasons.get(snum), 0) or 0
+                        season["total_episodes"] = max(
+                            _coerce_int(tmdb_total, 0) or 0,
+                            season.get("episode_count", 0),
+                            observed_max,
+                            prev_season_total,
+                        )
+                        season["has_tmdb_data"] = True
+            elif prev_total > 0:
+                # Use persisted totals as a fast fallback.
+                total_possible = max(prev_total, total_watched)
+                has_tmdb = True
+                for season in seasons_list:
+                    snum = season.get("season_number")
+                    observed_max = observed_by_season.get(snum, 0)
+                    prev_season_total = _coerce_int(prev_seasons.get(snum), 0) or 0
+                    season["total_episodes"] = max(
+                        season.get("episode_count", 0),
+                        observed_max,
+                        prev_season_total,
+                    )
+                    season["has_tmdb_data"] = True if prev_season_total > 0 else False
+
+            for season in seasons_list:
+                season["completion_percentage"] = 100
+                season["manually_completed"] = True
+
             s["total_episodes"] = total_watched
-            s["total_episodes_possible"] = total_watched
+            s["total_episodes_possible"] = max(total_possible, total_watched, prev_total)
             s["total_watches"] = sum(x["total_watches"] for x in seasons_list)
             s["completion_percentage"] = 100
-            s["has_tmdb_data"] = False
+            s["has_tmdb_data"] = has_tmdb
             s["manually_completed"] = True
             s["seasons"] = seasons_list
             s["has_new_content"] = False  # NEW: Flag for new content after manual complete
         else:
-            series_info = get_tmdb_series_info(series_name)
+            # Only use cached TMDB info here; never block /api/history on network.
+            series_info = None
+            if prev_total <= 0:
+                series_info = get_tmdb_series_info(series_name, expected_year=s.get("year"), allow_network=False)
+                if series_info and not _tmdb_matches_observed(series_info):
+                    series_info = None
             
             if series_info and series_info.get("total_episodes_in_series", 0) > 0:
                 total_possible = series_info["total_episodes_in_series"]
@@ -672,7 +1525,15 @@ def organize_data():
                         season["completion_percentage"] = 100
                         season["manually_completed"] = True
                     elif snum > 0 and snum in series_info.get("seasons", {}):
-                        season["total_episodes"] = series_info["seasons"][snum]["total_episodes"]
+                        tmdb_total = series_info["seasons"][snum]["total_episodes"]
+                        observed_max = observed_by_season.get(snum, 0)
+                        prev_season_total = _coerce_int(prev_seasons.get(snum), 0) or 0
+                        season["total_episodes"] = max(
+                            _coerce_int(tmdb_total, 0) or 0,
+                            season.get("episode_count", 0),
+                            observed_max,
+                            prev_season_total,
+                        )
                         season["has_tmdb_data"] = True
                         season_watched = season["episode_count"]
                         season_total = season["total_episodes"]
@@ -683,10 +1544,11 @@ def organize_data():
                         season["completion_percentage"] = pct
                 
                 s["total_episodes"] = total_watched
-                s["total_episodes_possible"] = total_possible
+                s["total_episodes_possible"] = max(total_possible, total_watched, prev_total)
                 s["total_watches"] = sum(x["total_watches"] for x in seasons_list)
                 
-                raw_pct = round((total_watched / total_possible) * 100) if total_possible > 0 else 0
+                pct_total = s["total_episodes_possible"]
+                raw_pct = round((total_watched / pct_total) * 100) if pct_total > 0 else 0
                 s["auto_all_added"] = (raw_pct >= 100 and not s.get("manually_completed"))
 
                 # Don't auto-show 100% unless manually completed
@@ -700,12 +1562,53 @@ def organize_data():
                 s["seasons"] = seasons_list
                 s["has_new_content"] = False
             else:
-                total_possible = total_watched
+                inferred_total = 0
+                for season in seasons_list:
+                    observed_max = 0
+                    for ep in season.get("episodes", []):
+                        ep_no = _coerce_int(ep.get("episode"), 0) or 0
+                        observed_max = max(observed_max, ep_no)
+
+                    prev_season_total = 0
+                    try:
+                        prev_season_total = _coerce_int(prev_seasons.get(season.get("season_number")), 0) or 0
+                    except Exception:
+                        prev_season_total = 0
+
+                    season_total = max(season.get("episode_count", 0), observed_max, prev_season_total)
+                    season["total_episodes"] = season_total
+                    season["has_tmdb_data"] = True if (prev_total > 0 or prev_season_total > 0) else False
+
+                    if season.get("manually_completed"):
+                        season["completion_percentage"] = 100
+                    else:
+                        spct = round((season.get("episode_count", 0) / season_total) * 100) if season_total > 0 else 0
+                        if spct >= 100:
+                            spct = 99
+                        season["completion_percentage"] = spct
+
+                    inferred_total += season_total
+
+                total_possible = inferred_total if inferred_total > 0 else total_watched
+                total_possible = max(total_possible, prev_total)
                 s["total_episodes"] = total_watched
-                s["total_episodes_possible"] = total_possible
+                if prev_total > 0:
+                    s["total_episodes_possible"] = max(total_possible, total_watched)
+                    s["tmdb_pending"] = False
+                else:
+                    # Brand-new show: avoid incorrect 1/1 totals while TMDB totals are fetched
+                    # asynchronously (webhook/prewarm will populate SHOW_TOTALS_FILE).
+                    s["total_episodes_possible"] = 0
+                    s["tmdb_pending"] = True
                 s["total_watches"] = sum(x["total_watches"] for x in seasons_list)
-                s["completion_percentage"] = 100
-                s["has_tmdb_data"] = False
+
+                pct = round((total_watched / total_possible) * 100) if total_possible > 0 else 0
+                if pct >= 100:
+                    pct = 99
+
+                # If TMDB totals are pending, don't pretend the show is nearly complete.
+                s["completion_percentage"] = pct if prev_total > 0 else 0
+                s["has_tmdb_data"] = True if prev_total > 0 else False
                 s["manually_completed"] = False
                 s["seasons"] = seasons_list
                 s["has_new_content"] = False
@@ -715,6 +1618,74 @@ def organize_data():
 
     movies_list = sorted(movies.values(), key=lambda x: x["watches"][0]["timestamp"] if x.get("watches") else "", reverse=True)
     shows_list = sorted(shows.values(), key=lambda x: x.get("total_watches", 0), reverse=True)
+
+    # Persist latest non-zero totals for resilience across cache clears/restarts.
+    try:
+        totals_payload = {}
+        for show in shows_list:
+            name = show.get("series_name")
+            if not name:
+                continue
+            # Avoid persisting inferred watched-only totals (causes 5/5 resets).
+            if not (show.get("has_tmdb_data") or show.get("manually_completed")):
+                continue
+            total_possible = _coerce_int(show.get("total_episodes_possible"), 0) or 0
+            season_map = {}
+            for season in show.get("seasons", []):
+                snum = _coerce_int(season.get("season_number"), 0) or 0
+                stotal = _coerce_int(season.get("total_episodes") or season.get("episode_count"), 0) or 0
+                if snum > 0 and stotal > 0:
+                    season_map[str(snum)] = stotal
+            if total_possible > 0 or season_map:
+                totals_payload[name] = {"total": total_possible, "seasons": season_map}
+        if totals_payload:
+            existing_totals = load_json_file(SHOW_TOTALS_FILE)
+            if existing_totals != totals_payload:
+                save_json_file(SHOW_TOTALS_FILE, totals_payload)
+    except Exception:
+        pass
+
+    # Attach rating and note for each movie and show from ratings file.  The ratings
+    # are stored using keys "movie|<title>|<year>" or "show|<series_name>".  If no
+    # rating exists then set None.
+    try:
+        ratings_cache = load_ratings()
+        # Movies
+        for m in movies_list:
+            try:
+                rkey = f"movie|{m.get('name')}|{m.get('year')}"
+                rinfo = ratings_cache.get(rkey, None)
+                if isinstance(rinfo, dict):
+                    m["rating"] = rinfo.get("rating")
+                    m["note"] = rinfo.get("note") or ""
+                else:
+                    m["rating"] = None
+                    m["note"] = ""
+            except Exception:
+                m["rating"] = None
+                m["note"] = ""
+        # Shows
+        for s in shows_list:
+            try:
+                rkey = f"show|{s.get('series_name')}"
+                rinfo = ratings_cache.get(rkey, None)
+                if isinstance(rinfo, dict):
+                    s["rating"] = rinfo.get("rating")
+                    s["note"] = rinfo.get("note") or ""
+                else:
+                    s["rating"] = None
+                    s["note"] = ""
+            except Exception:
+                s["rating"] = None
+                s["note"] = ""
+    except Exception:
+        # If ratings file cannot be loaded simply set rating to None and note to empty string
+        for m in movies_list:
+            m["rating"] = None
+            m["note"] = ""
+        for s in shows_list:
+            s["rating"] = None
+            s["note"] = ""
 
     week_ago = datetime.now() - timedelta(days=7)
     month_start = datetime.now().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
@@ -779,11 +1750,13 @@ def organize_data():
         "watch_streak": watch_streak,
         "quick_stats": quick_stats,
         "in_progress": in_progress,
-        "completed": completed
+        "completed": completed,
+        "sig": sig
     }
 
     cache["data"] = result
     cache["time"] = datetime.now()
+    cache["sig"] = sig
     
     return result
 
@@ -1054,8 +2027,47 @@ def radarr_import():
 def index():
     return """<!DOCTYPE html>
 <html><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no"/><title>Jellyfin Watch Tracker</title>
+<style>html,body{background:#0a0e27;color:#fff;}</style>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <style>
+/* === Additional styles for advanced features === */
+.rating-wrap{display:flex;flex-direction:column;gap:4px;margin-top:4px}
+.rating{display:inline-flex;gap:2px;cursor:pointer}
+.rating .star{font-size:1.1em;color:rgba(255,255,255,0.5);transition:color 0.2s;}
+.rating .star.filled{color:#ffd93d;}
+.rating-note{font-size:0.75em;opacity:0.75;line-height:1.2;word-break:break-word;}
+.grid-item .rating-wrap{align-items:center;text-align:center}
+.grid-item .rating{justify-content:center}
+.advanced-filters{display:flex;flex-wrap:wrap;gap:10px;margin-top:10px;align-items:center;width:100%}
+.advanced-filters select,.advanced-filters input{padding:8px 12px;border-radius:8px;border:2px solid rgba(255,255,255,0.1);background:rgba(20,25,45,0.6);color:#fff;font-size:13px;flex:1;min-width:120px}
+.advanced-filters button{padding:8px 12px;border-radius:8px;border:2px solid rgba(255,255,255,0.1);background:rgba(139,156,255,0.15);color:#8b9cff;font-weight:600;cursor:pointer;transition:background 0.2s}
+.advanced-filters button:hover{background:rgba(139,156,255,0.25)}
+#resultsCounter{font-size:0.9em;font-weight:600;margin-left:auto;opacity:0.8;white-space:nowrap}
+.auto-refresh{display:flex;align-items:center;gap:6px;margin-left:10px;}
+.auto-refresh input[type="checkbox"]{transform:scale(1.2);}
+.auto-refresh span{font-size:0.8em;opacity:0.7;}
+/* Theme variations */
+body.light{background:#f5f5f5;color:#1a1f3a;}
+body.light .header,body.light .content,body.light .stats .stat-card,body.light .filters,body.light .movie-item,body.light .show-group,body.light .genre-item,body.light .season-group,body.light .episode-item{background:rgba(255,255,255,0.9);color:#1a1f3a;border-color:rgba(0,0,0,0.1)}
+body.light .filter-btn{color:#8b9cff;background:rgba(139,156,255,0.15)}
+body.amoled{background:#000;color:#fff;}
+body.amoled .header,body.amoled .content,body.amoled .stats .stat-card,body.amoled .filters,body.amoled .movie-item,body.amoled .show-group,body.amoled .genre-item,body.amoled .season-group,body.amoled .episode-item{background:rgba(0,0,0,0.8);border-color:rgba(255,255,255,0.1);color:#fff}
+body.solarized{background:#002b36;color:#93a1a1;}
+body.solarized .header,body.solarized .content,body.solarized .stats .stat-card,body.solarized .filters,body.solarized .movie-item,body.solarized .show-group,body.solarized .genre-item,body.solarized .season-group,body.solarized .episode-item{background:rgba(0,43,54,0.8);color:#93a1a1;border-color:rgba(147,161,161,0.2)}
+body.nord{background:#2e3440;color:#d8dee9;}
+body.nord .header,body.nord .content,body.nord .stats .stat-card,body.nord .filters,body.nord .movie-item,body.nord .show-group,body.nord .genre-item,body.nord .season-group,body.nord .episode-item{background:rgba(46,52,64,0.8);border-color:rgba(216,222,233,0.1);color:#d8dee9}
+
+/* Layout variants for compact and spacious modes */
+:root.layout-compact .movie-item,:root.layout-compact .show-group,:root.layout-compact .genre-item,:root.layout-compact .season-group,:root.layout-compact .episode-item{
+  padding:8px;
+  margin-bottom:8px;
+  gap:8px;
+}
+:root.layout-spacious .movie-item,:root.layout-spacious .show-group,:root.layout-spacious .genre-item,:root.layout-spacious .season-group,:root.layout-spacious .episode-item{
+  padding:25px;
+  margin-bottom:20px;
+  gap:20px;
+}
 *{margin:0;padding:0;box-sizing:border-box}
 html{font-size:16px;height:100%}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:linear-gradient(135deg,#0a0e27 0%,#1a1f3a 100%);color:#fff;padding:15px;min-height:100%;overflow-y:auto}
@@ -1063,7 +2075,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .header{background:linear-gradient(135deg,rgba(139,156,255,0.15),rgba(255,107,107,0.15));backdrop-filter:blur(20px);border-radius:20px;padding:30px;margin-bottom:30px;border:1px solid rgba(255,255,255,0.1);box-shadow:0 8px 32px rgba(0,0,0,0.3);display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:20px}
 .header-title{display:flex;align-items:center;gap:15px}
 .logo{font-size:2.5em;filter:drop-shadow(0 4px 15px rgba(139,156,255,0.5))}
-.header h1{font-size:2em;font-weight:700;background:linear-gradient(135deg,#8b9cff,#ff8585);-webkit-background-clip:text;-webkit-text-fill-color:transparent;letter-spacing:-1px}
+.header h1{font-size:2em;font-weight:700;background:linear-gradient(135deg,#8b9cff,#ff8585);-webkit-background-clip:text;-webkit-text-fill-color:transparent;letter-spacing:-1px;line-height:1.4;padding-bottom:6px;overflow:visible}
 .btn{background:linear-gradient(135deg,#8b9cff,#6b8cff);color:#fff;border:none;padding:10px 16px;border-radius:12px;cursor:pointer;font-weight:600;font-size:13px;margin:3px;transition:all 0.3s;box-shadow:0 4px 15px rgba(139,156,255,0.3)}
 .btn:hover{transform:translate3d(0,-2px,0);}
 .btn:disabled{opacity:0.5;cursor:not-allowed;transform:none}
@@ -1932,6 +2944,361 @@ body.performance-mode .grid-item {
     top: auto !important;
   }
 }
+
+html.layout-compact .movie-item,
+html.layout-compact .show-group{
+  padding:10px !important;
+  margin-bottom:8px !important;
+  gap:10px !important;
+}
+
+html.layout-compact .poster,
+html.layout-compact .poster-placeholder{
+  width:75px !important;
+  height:112px !important;
+}
+
+html.layout-spacious .movie-item,
+html.layout-spacious .show-group{
+  padding:22px !important;
+  margin-bottom:16px !important;
+  gap:18px !important;
+}
+
+html.layout-spacious .poster,
+html.layout-spacious .poster-placeholder{
+  width:110px !important;
+  height:165px !important;
+}
+
+body.light { background:#f5f5f5 !important; color:#1a1f3a !important; }
+body.amoled { background:#000 !important; color:#fff !important; }
+body.solarized { background:#002b36 !important; color:#93a1a1 !important; }
+body.nord { background:#2e3440 !important; color:#d8dee9 !important; }
+
+/* ===== GRID default sizing (comfortable) ===== */
+.grid-view{
+  display:grid;
+  grid-template-columns:repeat(auto-fill,minmax(180px,1fr));
+  gap:16px;
+}
+
+.grid-item .poster-container{
+  width:100%;
+  aspect-ratio:2/3;
+  border-radius:14px;
+  overflow:hidden;
+  background:rgba(255,255,255,0.06);
+}
+
+.grid-item .poster-container img.poster{
+  width:100%;
+  height:100%;
+  object-fit:cover;
+  display:block;
+}
+
+/* Make titles under posters more readable */
+.grid-item-title{
+  margin-top:10px;
+  font-weight:800;
+  font-size:14px;
+  line-height:1.25;
+  color:rgba(255,255,255,0.95);
+  text-shadow:0 1px 2px rgba(0,0,0,0.55);
+  overflow:hidden;
+  display:-webkit-box;
+  -webkit-line-clamp:2;
+  -webkit-box-orient:vertical;
+}
+
+.grid-item-info{
+  color:rgba(255,255,255,0.70);
+  font-size:12px;
+  margin-top:6px;
+}
+
+/* ===== COMPACT ===== */
+html.layout-compact .grid-view{
+  grid-template-columns:repeat(auto-fill,minmax(150px,1fr));
+  gap:12px;
+}
+
+html.layout-compact .grid-item-title{
+  font-size:13px;
+}
+
+/* ===== SPACIOUS (bigger posters + bigger titles) ===== */
+html.layout-spacious .grid-view{
+  grid-template-columns:repeat(auto-fill,minmax(220px,1fr));
+  gap:20px;
+}
+
+html.layout-spacious .grid-item-title{
+  font-size:16px;
+}
+
+html.layout-spacious .grid-item-info{
+  font-size:13px;
+}
+
+/* ===== LIST poster sizing ===== */
+.movie-item .poster-container,
+.show-group .poster-container{
+  width:110px;
+  min-width:110px;
+}
+
+.movie-item .poster,
+.show-group .poster{
+  width:110px;
+  height:165px;
+  object-fit:cover;
+}
+
+html.layout-compact .movie-item .poster-container,
+html.layout-compact .show-group .poster-container{
+  width:90px;
+  min-width:90px;
+}
+
+html.layout-compact .movie-item .poster,
+html.layout-compact .show-group .poster{
+  width:90px;
+  height:135px;
+}
+
+html.layout-spacious .movie-item .poster-container,
+html.layout-spacious .show-group .poster-container{
+  width:150px;
+  min-width:150px;
+}
+
+html.layout-spacious .movie-item .poster,
+html.layout-spacious .show-group .poster{
+  width:150px;
+  height:225px;
+}
+
+/* ================================
+   GRID LAYOUT: Posters MUST fill
+   (Fix compact/spacious half posters)
+   ================================ */
+
+/* Make each grid card a vertical flex layout */
+.grid-item{
+  display: flex;
+  flex-direction: column;
+}
+
+/* Poster area should take consistent space */
+.grid-item .poster-container{
+  width: 100%;
+  aspect-ratio: 2 / 3;
+  min-height: 240px;           /* desktop safety */
+  border-radius: 18px;
+  overflow: hidden;
+  position: relative;
+  flex: 0 0 auto;              /* don't collapse */
+}
+
+/* FORCE the poster image to fill the container */
+.grid-item .poster-container img.poster{
+  width: 100% !important;
+  height: 100% !important;
+  display: block !important;
+  object-fit: cover !important;
+  object-position: center !important;
+}
+
+/* If you use placeholders, make them fill too */
+.grid-item .poster-container .poster-placeholder{
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* Grid column sizing per layout */
+.grid-view{
+  display: grid;
+  gap: 16px;
+  grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); /* Comfortable */
+}
+
+html.layout-compact .grid-view{
+  grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
+}
+
+html.layout-spacious .grid-view{
+  grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+}
+
+/* Mobile adjustments */
+@media (max-width: 480px){
+  .grid-item .poster-container{ min-height: 200px; }
+  html.layout-spacious .grid-view{ grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); }
+}
+
+/* ================================
+   Make names under posters clearer
+   ================================ */
+.grid-item-title{
+  font-weight: 800;
+  font-size: 1.05rem;
+  letter-spacing: 0.2px;
+  color: rgba(255,255,255,0.92);
+  text-shadow: 0 2px 10px rgba(0,0,0,0.55);
+  margin-top: 10px;
+}
+
+.grid-item-info{
+  color: rgba(255,255,255,0.70);
+  font-weight: 600;
+}
+
+.layout-row{
+  display:flex;
+  align-items:center;
+  gap:10px;
+  margin:10px 0 0 0;      /* spacing below grid controls */
+  padding:10px 12px;
+  border-radius:12px;
+  background: rgba(20,25,45,0.35);
+  border: 1px solid rgba(255,255,255,0.12);
+  width: fit-content;
+}
+
+.layout-label{
+  font-weight:700;
+  font-size:12px;
+  opacity:0.85;
+}
+
+.layout-select{
+  padding:8px 12px;
+  border-radius:10px;
+  border:1px solid rgba(255,255,255,0.18);
+  background: rgba(20,25,45,0.6);
+  color: inherit;
+  font-size: 13px;
+}
+
+/* Mobile: full width */
+@media (max-width: 520px){
+  .layout-row{ width:100%; }
+  .layout-select{ flex:1; }
+}
+
+@media (max-width: 768px) {
+  /* GRID: make the 3 modes clearly different on phones */
+  html.layout-compact .grid-view {
+    grid-template-columns: repeat(auto-fill, minmax(125px, 1fr)) !important;
+    gap: 10px !important;
+  }
+  html:not(.layout-compact):not(.layout-spacious) .grid-view {
+    /* Comfortable */
+    grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)) !important;
+    gap: 14px !important;
+  }
+  html.layout-spacious .grid-view {
+    grid-template-columns: repeat(auto-fill, minmax(175px, 1fr)) !important;
+    gap: 18px !important;
+  }
+
+  /* LIST: make padding/poster sizes differ so it’s obvious */
+  html.layout-compact .movie-item,
+  html.layout-compact .show-group {
+    padding: 10px !important;
+    gap: 10px !important;
+  }
+  html.layout-compact .movie-item .poster,
+  html.layout-compact .show-group .poster,
+  html.layout-compact .movie-item .poster-placeholder,
+  html.layout-compact .show-group .poster-placeholder {
+    width: 80px !important;
+    height: 120px !important;
+  }
+
+  html.layout-spacious .movie-item,
+  html.layout-spacious .show-group {
+    padding: 18px !important;
+    gap: 16px !important;
+  }
+  html.layout-spacious .movie-item .poster,
+  html.layout-spacious .show-group .poster,
+  html.layout-spacious .movie-item .poster-placeholder,
+  html.layout-spacious .show-group .poster-placeholder {
+    width: 120px !important;
+    height: 180px !important;
+  }
+}
+
+/* === FIX 1: force Layout dropdown row below the view-toggle buttons === */
+#layoutRow {
+  flex-basis: 100% !important;
+  width: 100% !important;
+  margin-top: 6px !important;
+  margin-left: auto !important;
+  justify-content: flex-end !important;
+  padding: 0 !important;
+  background: transparent !important;
+  border: none !important;
+}
+#layoutRow .layout-select{
+  width: auto;
+  min-width: 160px;
+}
+
+/* === FIX 3: mobile layout mode must visibly change (compact/comfortable/spacious) === */
+@media (max-width: 768px) {
+  /* GRID: make the 3 modes clearly different on phones */
+  html.layout-compact .grid-view {
+    grid-template-columns: repeat(auto-fill, minmax(125px, 1fr)) !important;
+    gap: 10px !important;
+  }
+
+  /* Comfortable (default) */
+  html:not(.layout-compact):not(.layout-spacious) .grid-view {
+    grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)) !important;
+    gap: 14px !important;
+  }
+
+  html.layout-spacious .grid-view {
+    grid-template-columns: repeat(auto-fill, minmax(175px, 1fr)) !important;
+    gap: 18px !important;
+  }
+
+  /* LIST: make padding/poster sizes differ so it’s obvious */
+  html.layout-compact .movie-item,
+  html.layout-compact .show-group {
+    padding: 10px !important;
+    gap: 10px !important;
+  }
+
+  html.layout-compact .movie-item .poster,
+  html.layout-compact .show-group .poster,
+  html.layout-compact .movie-item .poster-placeholder,
+  html.layout-compact .show-group .poster-placeholder {
+    width: 80px !important;
+    height: 120px !important;
+  }
+
+  html.layout-spacious .movie-item,
+  html.layout-spacious .show-group {
+    padding: 18px !important;
+    gap: 16px !important;
+  }
+
+  html.layout-spacious .movie-item .poster,
+  html.layout-spacious .show-group .poster,
+  html.layout-spacious .movie-item .poster-placeholder,
+  html.layout-spacious .show-group .poster-placeholder {
+    width: 120px !important;
+    height: 180px !important;
+  }
+}
 </style></head>
 <body><div class="container">
 <div class="header">
@@ -1939,7 +3306,7 @@ body.performance-mode .grid-item {
     <div class="logo">🎬</div>
     <h1>Jellyfin Watch Tracker</h1>
   </div>
-  <div class="header-toolbar">
+    <div class="header-toolbar">
     <div class="zoom-control">
       <label>Zoom</label>
       <input type="range" class="zoom-slider" id="zoomSlider" min="70" max="150" value="100" step="5">
@@ -1959,6 +3326,27 @@ body.performance-mode .grid-item {
         <button class="btn small" onclick="exportData('csv');toggleExportOptions();">📊 CSV</button>
       </div>
     </div>
+
+      <!-- Undo button -->
+      <button class="btn secondary" id="undoBtn" onclick="undoAction()">↩️ Undo</button>
+
+      <!-- Auto-refresh controls -->
+      <div class="auto-refresh">
+        <label style="display:flex;align-items:center;gap:4px;">
+          <input type="checkbox" id="autoRefreshToggle" onchange="toggleAutoRefresh()"> Auto-Refresh
+        </label>
+        <select id="autoRefreshInterval" onchange="updateAutoRefreshInterval()" style="padding:4px 6px;border-radius:6px;border:1px solid rgba(255,255,255,0.2);background:rgba(20,25,45,0.6);color:inherit;font-size:12px;">
+          <option value="1">1m</option>
+          <option value="5" selected>5m</option>
+          <option value="10">10m</option>
+          <option value="15">15m</option>
+          <option value="30">30m</option>
+        </select>
+        <span id="refreshCountdown"></span>
+      </div>
+
+      <!-- Theme selector removed: theme is toggled via the Theme button -->
+
   </div>
 </div>
 
@@ -1990,28 +3378,69 @@ body.performance-mode .grid-item {
 </div>
 
 <div class="filters">
-<button class="filter-btn active" onclick="setFilter('all',event)">All</button>
-<button class="filter-btn" onclick="setFilter('movies',event)">Movies</button>
-<button class="filter-btn" onclick="setFilter('shows',event)">TV Shows</button>
-<button class="filter-btn" onclick="setFilter('incomplete',event)">📋 Incomplete</button>
-<select id="sort" onchange="renderHistory()">
-<option value="recent">Most Recent</option>
-<option value="oldest">Oldest First</option>
-<option value="most_watched">Most Watched</option>
-<option value="alphabetical">A-Z</option>
-<option value="incomplete_first">Incomplete First</option>
-</select>
-<div class="search-box">
-<input type="text" id="search" placeholder="🔍 Search..." oninput="renderHistory()">
+  <button class="filter-btn active" onclick="setFilter('all', event)">All</button>
+  <button class="filter-btn" onclick="setFilter('movies', event)">Movies</button>
+  <button class="filter-btn" onclick="setFilter('shows', event)">TV Shows</button>
+  <button class="filter-btn" onclick="setFilter('incomplete', event)">Incomplete</button>
+
+  <select id="sort" onchange="renderHistory()">
+    <option value="recent">Most Recent</option>
+    <option value="oldest">Oldest First</option>
+    <option value="mostwatched">Most Watched</option>
+    <option value="alphabetical">A-Z</option>
+    <option value="incompletefirst">Incomplete First</option>
+  </select>
+
+  <div class="search-box">
+    <input type="text" id="search" placeholder="Search..." oninput="renderHistory()">
+  </div>
+
+  <div class="view-toggle">
+    <button class="active" onclick="setView('list', event)">List</button>
+    <button onclick="setView('grid', event)">Grid</button>
+
+    <button id="gridSelectBtn" onclick="toggleGridSelectMode(event)" style="display:none;">Select</button>
+    <button id="gridSelectAllBtn" onclick="gridSelectAll(event)" style="display:none;">All</button>
+    <button id="gridClearBtn" onclick="gridClearSelection(event)" style="display:none;">Clear</button>
+  </div>
+
+  <!-- Layout control row below Grid Select -->
+  <div id="layoutRow" class="layout-row">
+    <label for="layoutSelect" class="layout-label">Layout</label>
+    <select id="layoutSelect" onchange="changeLayout(this.value)" class="layout-select">
+      <option value="comfortable">Comfortable</option>
+      <option value="compact">Compact</option>
+      <option value="spacious">Spacious</option>
+    </select>
+  </div>
 </div>
-<div class="view-toggle">
-<button class="active" onclick="setView('list',event)">📋 List</button>
-<button onclick="setView('grid',event)">⊞ Grid</button>
-<button id="gridSelectBtn" onclick="toggleGridSelectMode(event)" style="display:none">☑️ Select</button>
-<button id="gridSelectAllBtn" onclick="gridSelectAll(event)" style="display:none">✓ All</button>
-<button id="gridClearBtn" onclick="gridClearSelection(event)" style="display:none">✕ Clear</button>
+
+<!-- Advanced search and filter controls -->
+<div class="advanced-filters">
+  <select id="genreFilter" onchange="applyFilters()">
+    <option value="">All Genres</option>
+  </select>
+
+  <input type="number" id="yearFrom" placeholder="From Year" onchange="applyFilters()">
+  <input type="number" id="yearTo" placeholder="To Year" onchange="applyFilters()">
+
+  <select id="statusFilter" onchange="applyFilters()">
+    <option value="">All Statuses</option>
+    <option value="completed">Completed</option>
+    <option value="inprogress">In Progress</option>
+  </select>
+
+  <select id="typeFilter" onchange="applyFilters()">
+    <option value="all">All Types</option>
+    <option value="movie">Movies Only</option>
+    <option value="show">Shows Only</option>
+  </select>
+
+  <button onclick="clearFilters()">Clear</button>
+
+  <span id="resultsCounter">Found 0 movies, 0 shows</span>
 </div>
-</div>
+
 
 <div id="grid-bulk-bar" class="bulk-bar">
   <div class="bulk-info"><span id="grid-bulk-count">0</span> selected</div>
@@ -2043,6 +3472,23 @@ body.performance-mode .grid-item {
 <h3 style="font-size:1.4em;margin-bottom:15px;color:#8b9cff">🔥 Trending This Week</h3>
 <div id="trending-content"></div>
 </div>
+
+<!-- Watch Time Analytics section -->
+<div style="background:rgba(20,25,45,0.8);backdrop-filter:blur(10px);border-radius:16px;padding:20px;margin-bottom:25px;border:1px solid rgba(255,255,255,0.08)">
+  <h3 style="font-size:1.4em;margin-bottom:15px;color:#8b9cff">⏱️ Watch Time Analytics</h3>
+  <div style="display:flex;flex-wrap:wrap;gap:20px">
+    <div style="flex:1;min-width:240px">
+      <p>Total: <span id="wt-total">0h</span></p>
+      <p>Movies: <span id="wt-movies">0h</span></p>
+      <p>Shows: <span id="wt-shows">0h</span></p>
+      <p>Daily Avg: <span id="wt-daily">0h</span></p>
+      <p>Binge Sessions: <span id="wt-binge">0</span></p>
+    </div>
+    <div style="flex:2;min-width:300px">
+      <canvas id="watchTimeChart" height="200"></canvas>
+    </div>
+  </div>
+</div>
 </div>
 
 <div id="progress-tab" class="tab-content">
@@ -2051,7 +3497,7 @@ body.performance-mode .grid-item {
 <div style="background:rgba(20,25,45,0.8);backdrop-filter:blur(10px);border-radius:16px;padding:20px;margin-bottom:25px;border:1px solid rgba(255,255,255,0.08)">
   <div style="display:flex;justify-content:space-between;align-items:center;cursor:pointer" onclick="toggleSection('movies-progress-list','movies-progress-arrow')">
     <h3 style="font-size:1.4em;margin:0;color:#8b9cff">🎬 Movies Progress</h3>
-    <span id="movies-progress-arrow" style="transition:transform 0.3s;display:inline-block">▶</span>
+    <span id="movies-progress-arrow" style="transition:transform 0.3s;display:inline-block">&#9654;</span>
   </div>
   <div id="movies-progress-list" style="display:none;margin-top:15px">
     <div id="movies-progress-controls" style="display:flex;flex-wrap:wrap;gap:10px;margin-bottom:10px">
@@ -2069,7 +3515,7 @@ body.performance-mode .grid-item {
 <div style="background:rgba(20,25,45,0.8);backdrop-filter:blur(10px);border-radius:16px;padding:20px;border:1px solid rgba(255,255,255,0.08)">
   <div style="display:flex;justify-content:space-between;align-items:center;cursor:pointer" onclick="toggleSection('shows-progress-list','shows-progress-arrow')">
     <h3 style="font-size:1.4em;margin:0;color:#6bcf7f">📺 Shows Progress</h3>
-    <span id="shows-progress-arrow" style="transition:transform 0.3s;display:inline-block">▶</span>
+    <span id="shows-progress-arrow" style="transition:transform 0.3s;display:inline-block">&#9654;</span>
   </div>
   <div id="shows-progress-list" style="display:none;margin-top:15px">
     <div id="shows-progress-controls" style="display:flex;flex-wrap:wrap;gap:10px;margin-bottom:10px">
@@ -2309,14 +3755,37 @@ body.performance-mode .grid-item {
 </div>
 
 <script>
-let data={};let filter='all';let genreChart=null;let currentPosterItem=null;let viewMode_movies = "list";let viewMode_shows = "list";let viewMode_all = "list";let viewMode_incomplete = "list";let currentManageShow=null;let selectedEpisodes=new Set();
-let uiTheme = 'dark';
+let data={};let filter='all';let genreChart=null;let currentPosterItem=null;let viewMode_movies = "list";let viewMode_shows = "list";let viewMode_all = "list";let viewMode_incomplete = "list";let currentManageShow=null;let selectedEpisodes=new Set();let genresRenderedSig=null;
+let historySig = null;
+const HISTORY_FETCH_TIMEOUT_MS = 120000;
+const RECS_FETCH_TIMEOUT_MS = 25000;
+const INSIGHTS_FETCH_TIMEOUT_MS = 20000;
+let sigPollTimer = null;
+let sigPollBusy = false;
+let sigPollDelay = 1500;
+let sigPollFailures = 0;
+let quickReloadBusy = false;
+let eventsSource = null;
+let realtimeConnected = false;
+let lastRealtimeSeq = 0;
+let realtimeFailures = 0;
+let loadRetryTimer = null;
+let loadRetryDelayMs = 1200;
+let reloadFailureCount = 0;
+let genreRenderToken = 0;
+let recommendationsRequestToken = 0;
+// Compatibility fallback for older cached UI fragments that reference `insights`.
+let insights = { success: false, combos: [], moods: {} };
+// Chart instance for watch time analytics
+let watchTimeChart = null;
+let uiTheme = localStorage.getItem('theme') || localStorage.getItem('uiTheme') || 'dark';
 let openPanels = new Set();
 let scrollPosition = 0;
 let gridSelectMode = false;
 let selectedGridItems = new Set(); // key format: movie|<name>|<year>  or  show|<series>
 let performanceMode = false;  // ADD THIS LINE
 let currentPage = 1;  // ADD THIS LINE
+let enableLoadMoreInQuality = true; // set false if you ever want to disable it
 const itemsPerPage = 50;
 // Offsets for fetching new recommendation batches.  Separate counters are
 // maintained for movies and shows so that the user can request more
@@ -2332,6 +3801,42 @@ let recommendationOffsetShows = 0;
 // arrays are updated independently when the user requests more movies or shows.
 let currentMoviesRecs = [];
 let currentShowsRecs = [];
+let lastRecsTopGenre = null;
+let lastRecsError = null;
+let lastRecsLoadingSection = null; // 'all' | 'movies' | 'shows' | null
+
+function getCachedRecs(){
+  try{
+    const raw = sessionStorage.getItem('recsCache');
+    if(!raw) return null;
+    const obj = JSON.parse(raw);
+    if(!obj || !obj.data) return null;
+    // Expire after 12 hours to avoid very stale UI
+    if(obj.ts && (Date.now() - obj.ts) > (12*60*60*1000)) return null;
+    return obj.data;
+  }catch(e){
+    return null;
+  }
+}
+
+function storeCachedRecs(payload){
+  try{
+    if(!payload || !payload.success) return;
+    const wrapper = { ts: Date.now(), data: payload };
+    const raw = JSON.stringify(wrapper);
+    if(raw.length < 1_000_000){
+      sessionStorage.setItem('recsCache', raw);
+    }
+  }catch(e){}
+}
+
+function scrollToRecommendations(){
+  const el = document.getElementById('recommendations-container');
+  if(!el) return;
+  el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  // account for the fixed header
+  setTimeout(() => { window.scrollBy(0, -90); }, 0);
+}
 
 // Progress list search, sort and filter settings. These are persisted to
 // localStorage so that the user's preferences are remembered across page
@@ -2380,6 +3885,18 @@ const moodGenreMap = {
 // This allows us to detect when the user leaves the progress tab so we can
 // reset any search filter applied while navigating from the progress view.
 let currentTab = 'history';
+
+function genreKeyFromName(name){
+  return encodeURIComponent(String(name == null ? '' : name));
+}
+
+function genreNameFromKey(key){
+  try {
+    return decodeURIComponent(String(key == null ? '' : key));
+  } catch(_) {
+    return String(key == null ? '' : key);
+  }
+}
 
 // Collapsed state flags for the shows progress categories.  These
 // variables control whether the In Progress and Completed lists are
@@ -2583,7 +4100,7 @@ async function gridBulkDelete(){
   }
 }
 
-function saveState() {
+function saveState(targetKey) {
   scrollPosition = window.pageYOffset || document.documentElement.scrollTop;
   saveOpenPanels();
   localStorage.setItem('filter', filter);
@@ -2604,6 +4121,9 @@ function saveState() {
       break;
     }
   }
+  if(targetKey){
+    sessionStorage.setItem('restoreTarget', targetKey);
+  }
 }
 
 function restoreState() {
@@ -2611,12 +4131,40 @@ function restoreState() {
   const shouldRestore = sessionStorage.getItem('shouldRestore');
   if(!shouldRestore) return;
   
-  // Clear the flag immediately
+  // Allow a one-time panel restore, then clear the flag immediately
+  sessionStorage.setItem('restorePanelsOnce', 'true');
   sessionStorage.removeItem('shouldRestore');
   
   // Get saved scroll position
   const savedScroll = parseInt(sessionStorage.getItem('scrollPosition')) || scrollPosition;
   const lastViewedShow = sessionStorage.getItem('lastViewedShow');
+  const restoreTarget = sessionStorage.getItem('restoreTarget');
+
+  function findRestoreTarget(key){
+    if(!key) return null;
+    try{
+      if(viewMode === 'grid'){
+        return document.querySelector(`[data-grid-key="${CSS.escape(key)}"]`);
+      }
+    }catch(e){}
+
+    if(key.startsWith('show|')){
+      const name = key.slice('show|'.length);
+      const enc = encodeURIComponent(name || '').split("'").join('%27');
+      return document.querySelector(`.show-group[data-show-name="${enc}"]`);
+    }
+    if(key.startsWith('movie|')){
+      const parts = key.split('|');
+      const yearStr = parts.pop();
+      const name = parts.slice(1).join('|');
+      const enc = encodeURIComponent(name || '').split("'").join('%27');
+      const items = Array.from(document.querySelectorAll(`.movie-item[data-movie-name="${enc}"]`));
+      if(items.length === 0) return null;
+      if(!yearStr) return items[0];
+      return items.find(el => (el.querySelector('.movie-title')?.textContent || '').includes(`(${yearStr})`)) || items[0];
+    }
+    return null;
+  }
   
   // Restore panels FIRST, then scroll (important order!)
   setTimeout(() => {
@@ -2625,14 +4173,23 @@ function restoreState() {
     
     // Small delay to let panels open, then scroll
     setTimeout(() => {
-      if(lastViewedShow && document.getElementById(lastViewedShow)) {
+      let restored = false;
+      if(restoreTarget){
+        const targetEl = findRestoreTarget(restoreTarget);
+        if(targetEl){
+          targetEl.scrollIntoView({ behavior: 'instant', block: 'center' });
+          window.scrollBy(0, -100);
+          restored = true;
+        }
+      }
+      if(!restored && lastViewedShow && document.getElementById(lastViewedShow)) {
         // Scroll to the specific show they were viewing
         const element = document.getElementById(lastViewedShow).closest('.show-group');
         if(element) {
           element.scrollIntoView({ behavior: 'instant', block: 'start' });
           window.scrollBy(0, -100);
         }
-      } else {
+      } else if(!restored) {
         // Fallback to exact pixel position
         window.scrollTo({
           top: savedScroll,
@@ -2644,24 +4201,53 @@ function restoreState() {
       // Clean up after restoration
       sessionStorage.removeItem('scrollPosition');
       sessionStorage.removeItem('lastViewedShow');
+      sessionStorage.removeItem('restoreTarget');
       sessionStorage.removeItem('openPanels');
     }, 100);
   }, 150);
 }
 
+// Themes available for cycling via the theme toggle button.  'dark' is the
+// default base theme; other values apply a class to the <body> element.
+const availableThemes = ['dark','light','amoled','solarized','nord'];
+
+/**
+ * Apply the given theme. Removes any previous theme classes and adds the
+ * appropriate class if the theme is not 'dark'. Also updates the
+ * persistent storage and the theme toggle button label.
+ *
+ * @param {string} theme The desired theme name.
+ */
 function applyTheme(theme){
-  uiTheme = theme === 'light' ? 'light' : 'dark';
-  document.body.classList.toggle('light', uiTheme === 'light');
+  uiTheme = availableThemes.includes(theme) ? theme : 'dark';
+
+  // Clear theme classes (dark is the base)
+  document.body.classList.remove('light','amoled','solarized','nord');
+  if(uiTheme !== 'dark') document.body.classList.add(uiTheme);
+
+  // Save in BOTH keys (important)
+  localStorage.setItem('theme', uiTheme);
   localStorage.setItem('uiTheme', uiTheme);
 
+  // Update button label
   const btn = document.getElementById('themeToggleBtn');
   if(btn){
-    btn.textContent = (uiTheme === 'light') ? '☀️ Theme' : '🌙 Theme';
+    let emoji = '🌙';
+    if(uiTheme === 'light') emoji = '☀️';
+    else if(uiTheme === 'amoled') emoji = '🖤';
+    else if(uiTheme === 'solarized') emoji = '🌅';
+    else if(uiTheme === 'nord') emoji = '❄️';
+    btn.textContent = `${emoji} Theme`;
   }
 }
 
 function toggleTheme(){
-  applyTheme(uiTheme === 'light' ? 'dark' : 'light');
+  // If uiTheme was never set properly, recover from storage
+  if(!uiTheme) uiTheme = localStorage.getItem('theme') || localStorage.getItem('uiTheme') || 'dark';
+
+  const idx = availableThemes.indexOf(uiTheme);
+  const next = availableThemes[(idx + 1) % availableThemes.length];
+  applyTheme(next);
 }
 
 function togglePerformanceMode() {
@@ -2704,6 +4290,10 @@ function saveOpenPanels() {
 }
 
 function restoreOpenPanels() {
+  // Only restore panels when explicitly requested (e.g. after delete/undo)
+  const restoreOnce = sessionStorage.getItem('restorePanelsOnce');
+  if(!restoreOnce) return;
+  sessionStorage.removeItem('restorePanelsOnce');
   // Load from sessionStorage
   const savedPanels = sessionStorage.getItem('openPanels');
   if(savedPanels) {
@@ -2726,13 +4316,120 @@ function restoreOpenPanels() {
   }
 }
 
+function applyStatsFromData(){
+  if(!data || !data.stats) return;
+  document.getElementById('total').textContent = data.stats.total_watches || 0;
+  document.getElementById('movies').textContent = data.stats.unique_movies || 0;
+  const showCount = (data.stats.tv_shows != null) ? data.stats.tv_shows : (data.stats.unique_shows || 0);
+  document.getElementById('shows').textContent = showCount;
+  document.getElementById('week').textContent = data.stats.this_week || 0;
+  document.getElementById('hours').textContent = formatDurationHours(data.stats.total_hours || 0);
+  document.getElementById('avg').textContent = data.stats.avg_per_day || 0;
+}
+
+function renderAllFromData(){
+  if(!data) return;
+  applyStatsFromData();
+  renderHistory();
+  renderAnalytics();
+  // Reset progress pagination and collapsed states on initial load to
+  // ensure the correct sections expand/collapse according to the
+  // saved filter (inprogress/complete/all) before rendering.
+  resetProgressPagination();
+  renderProgress();
+  try { populateGenreFilter(); } catch(e) { console.error(e); }
+  showGridSelectButton();
+  updateGridBulkBar();
+  // Restore state after a longer delay to ensure DOM is ready
+  setTimeout(() => {
+    try { restoreState(); } catch(e) {}
+  }, 200);
+}
+
+function getCachedHistory(){
+  try {
+    const raw = sessionStorage.getItem('historyCache');
+    if(!raw) return null;
+    const obj = JSON.parse(raw);
+    if(!obj || !obj.data) return null;
+    return obj;
+  } catch(e) {
+    return null;
+  }
+}
+
+function storeCachedHistory(payload){
+  try {
+    if(!payload) return;
+    const wrapper = { ts: Date.now(), sig: payload.sig || null, data: payload };
+    const raw = JSON.stringify(wrapper);
+    // Avoid exceeding storage limits
+    if(raw.length < 4_000_000){
+      sessionStorage.setItem('historyCache', raw);
+    }
+  } catch(e) {}
+}
+
+async function fetchJsonWithTimeout(url, timeoutMs){
+  if(!timeoutMs || timeoutMs <= 0){
+    const r = await fetch(url, { cache: 'no-store' });
+    if(!r.ok){
+      throw new Error(`HTTP ${r.status}`);
+    }
+    return await r.json();
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const r = await fetch(url, { cache: 'no-store', signal: controller.signal });
+    if(!r.ok){
+      throw new Error(`HTTP ${r.status}`);
+    }
+    return await r.json();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function clearLoadRetry(){
+  if(loadRetryTimer){
+    clearTimeout(loadRetryTimer);
+    loadRetryTimer = null;
+  }
+  loadRetryDelayMs = 1200;
+}
+
+function scheduleLoadRetry(){
+  if(loadRetryTimer) return;
+  const delay = loadRetryDelayMs;
+  loadRetryDelayMs = Math.min(loadRetryDelayMs * 2, 15000);
+  loadRetryTimer = setTimeout(async () => {
+    loadRetryTimer = null;
+    try {
+      await quickReload(false);
+    } catch(_) {}
+  }, delay);
+}
+
 async function load(){
-  const r=await fetch('/api/history');
-  data=await r.json();
+  // Use cached history for instant render while fresh data loads
+  const cached = getCachedHistory();
+  if(cached && cached.data){
+    data = cached.data;
+    historySig = data.sig || historySig;
+  }
+  const savedTab = localStorage.getItem('currentTab');
   
-  // Theme restore
-  const savedTheme = localStorage.getItem('uiTheme') || 'dark';
+  // Theme & layout restore: prefer saved theme in localStorage
+  const savedTheme = localStorage.getItem('theme') || localStorage.getItem('uiTheme') || 'dark';
   applyTheme(savedTheme);
+  const themeSelectEl = document.getElementById('themeSelect');
+  if (themeSelectEl) themeSelectEl.value = savedTheme;
+  // Layout restore
+  const savedLayout = localStorage.getItem('layout') || 'comfortable';
+  applyLayout(savedLayout);
+  const layoutSelectEl = document.getElementById('layoutSelect');
+  if (layoutSelectEl) layoutSelectEl.value = savedLayout;
   console.log('Loaded data:', data);
   
   // Performance mode restore - ADD THIS
@@ -2797,51 +4494,126 @@ async function load(){
     document.querySelectorAll('.view-toggle button')[0].classList.add('active');
   }
   
-  showGridSelectButton();
-  
-  document.getElementById('total').textContent=data.stats.total_watches;
-  document.getElementById('movies').textContent=data.stats.unique_movies;
-  document.getElementById('shows').textContent=data.stats.tv_shows;
-  document.getElementById('week').textContent=data.stats.this_week;
-  document.getElementById('hours').textContent=data.stats.total_hours+'h';
-  document.getElementById('avg').textContent=data.stats.avg_per_day;
-  
-      renderHistory();
-      renderGenres();
-      renderAnalytics();
-      // Reset progress pagination and collapsed states on initial load to
-      // ensure the correct sections expand/collapse according to the
-      // saved filter (inprogress/complete/all) before rendering.
-      resetProgressPagination();
-      renderProgress();
-  
-  // Restore state after a longer delay to ensure DOM is ready
-  setTimeout(() => {
-    restoreState();
-  }, 200);
+  // Restore auto-refresh controls
+      const autoToggle = document.getElementById('autoRefreshToggle');
+      if (autoToggle) {
+        autoToggle.checked = autoRefreshEnabled;
+      }
+      const autoIntervalSel = document.getElementById('autoRefreshInterval');
+      if (autoIntervalSel) {
+        autoIntervalSel.value = String(autoRefreshInterval);
+      }
+      // Start auto-refresh if enabled
+  if (autoRefreshEnabled) { startAutoRefresh(); } else { updateRefreshIndicator(0); }
+  // Register service worker for PWA
+  if ('serviceWorker' in navigator) {
+        if ('caches' in window) {
+          caches.keys().then(function(keys){
+            keys.forEach(function(k){
+              if (k && k.startsWith('watch-tracker-') && k !== 'watch-tracker-v21') {
+                caches.delete(k).catch(function(){});
+              }
+            });
+          }).catch(function(){});
+        }
+    navigator.serviceWorker.register('/sw.js', { updateViaCache: 'none' })
+      .then(function(reg){ try { reg.update(); } catch(e) {} })
+      .catch(function(e){ console.warn('SW registration failed', e); });
+  }
+
+  if(cached && cached.data){
+    renderAllFromData();
+    if(savedTab) setActiveTab(savedTab);
+  }
+
+  // Fetch fresh data and re-render only if changed
+  try {
+    const fresh = await fetchJsonWithTimeout('/api/history', HISTORY_FETCH_TIMEOUT_MS);
+    const prevSig = historySig;
+    const nextSig = fresh && fresh.sig ? fresh.sig : null;
+    data = fresh || data;
+    if(nextSig) historySig = nextSig;
+    const shouldRender = (!cached || !cached.sig || !nextSig || cached.sig !== nextSig || !prevSig);
+    if(shouldRender){
+      data = fresh;
+      renderAllFromData();
+      if(savedTab) setActiveTab(savedTab);
+    }
+    storeCachedHistory(fresh);
+    clearLoadRetry();
+    reloadFailureCount = 0;
+  } catch(e) {
+    reloadFailureCount += 1;
+    if(e && e.name === 'AbortError'){
+      // transient timeout/abort, keep cached UI
+    } else if(reloadFailureCount % 5 === 1){
+      console.warn('Load error:', (e && e.message) ? e.message : e);
+    }
+    scheduleLoadRetry();
+  }
+
+  startSigPolling();
 }
 
-async function quickReload(){
+/**
+ * Reload history data from the server and update UI. During regular reloads (e.g. manual
+ * refresh or first load) we show the content-loading spinner. When performing an
+ * auto-refresh in the background we avoid showing the spinner to prevent layout
+ * contraction on desktop.
+ *
+ * @param {boolean} showLoading If true, show the loading spinner; otherwise reload silently.
+ */
+async function quickReload(showLoading = false) {
+  if (quickReloadBusy) return;
+  quickReloadBusy = true;
   const content = document.getElementById('content');
-  content.classList.add('content-loading');
-  
+
+  if (showLoading && content) {
+    content.classList.add('content-loading');
+  }
+
   try {
-    const r = await fetch('/api/history');
-    data = await r.json();
-    
-    document.getElementById('total').textContent = data.stats.total_watches;
-    document.getElementById('movies').textContent = data.stats.unique_movies;
-    document.getElementById('shows').textContent = data.stats.tv_shows;
-    document.getElementById('week').textContent = data.stats.this_week;
-    document.getElementById('hours').textContent = data.stats.total_hours + 'h';
-    document.getElementById('avg').textContent = data.stats.avg_per_day;
-    
-    renderHistory();
-    restoreState();
-  } catch(e) {
-    console.error('Reload failed:', e);
+    if (showLoading) {
+      const cached = getCachedHistory();
+      if (cached && cached.data) {
+        data = cached.data;
+        applyStatsFromData();
+        setActiveTab(currentTab);
+        try { restoreState(); } catch(e) { console.error('Restore state failed:', e); }
+      }
+    }
+
+    const prevSig = historySig;
+    const fresh = await fetchJsonWithTimeout('/api/history', HISTORY_FETCH_TIMEOUT_MS);
+    const nextSig = fresh && fresh.sig ? fresh.sig : null;
+    const sigChanged = !prevSig || !nextSig || prevSig !== nextSig;
+
+    data = fresh || data;
+    if(nextSig) historySig = nextSig;
+    storeCachedHistory(data);
+    clearLoadRetry();
+    reloadFailureCount = 0;
+
+    if(sigChanged){
+      applyStatsFromData();
+      setActiveTab(currentTab);
+      try { restoreState(); } catch(e) { console.error('Restore state failed:', e); }
+    }
+  } catch (e) {
+    reloadFailureCount += 1;
+    if (e && e.name === 'AbortError') {
+      // Ignore fetch aborts caused by browser/network transitions.
+    } else {
+      if(reloadFailureCount % 5 === 1){
+        console.warn('Auto-refresh error', (e && e.message) ? e.message : e);
+      }
+    }
+    scheduleLoadRetry();
   } finally {
-    content.classList.remove('content-loading');
+    quickReloadBusy = false;
+    if (showLoading && content) {
+      content.classList.remove('content-loading');
+    }
   }
 }
 
@@ -2955,7 +4727,8 @@ async function gridBulkMarkComplete(){
   const showKeys = items.filter(k => k.startsWith('show|'));
   if(showKeys.length === 0) return; // silent
 
-  saveState();
+  const firstKey = showKeys[0];
+  saveState(firstKey || undefined);
 
   try{
     setGridBulkStatus(`Marking 0/${showKeys.length}…`);
@@ -2994,68 +4767,71 @@ async function gridBulkMarkComplete(){
   }
 }
 
-function gridItemClick(seriesName,isShow){
-      if(isShow){
-        // When a show card is clicked in the progress view, ensure the library
-        // shows tab is active and the filter is set to shows.  Switch to list
-        // view and persist these settings.  Clear the search box so all
-        // shows are visible, then re-render the history view and scroll
-        // to the target show element.
-        // Switch to the Library (history) tab so the user can see the show.
-        const historyBtn = document.querySelector(".tab-btn[onclick*='history']");
-        if(historyBtn){
-          switchTab({ target: historyBtn }, 'history');
+function gridItemClick(seriesName, isShow) {
+  if (!isShow) return;
+
+  // Switch to the Library (history) tab so the user can see the show.
+  const historyBtn = document.querySelector(".tab-btn[onclick*='history']");
+  if (historyBtn) {
+    switchTab({ target: historyBtn }, 'history');
+  }
+
+  filter = 'shows';
+  localStorage.setItem('filter', 'shows');
+  viewMode_shows = 'list';
+  localStorage.setItem('viewMode_shows', 'list');
+
+  // Reset view toggle buttons to reflect list mode
+  document.querySelectorAll('.view-toggle button').forEach(b => b.classList.remove('active'));
+  const firstToggle = document.querySelector('.view-toggle button:first-child');
+  if (firstToggle) firstToggle.classList.add('active');
+
+  // Clear the search input so the show appears in the list
+  const searchInput = document.getElementById('search');
+  if (searchInput && searchInput.value) {
+    searchInput.value = '';
+  }
+
+  // Render history with the updated filter and view
+  renderHistory();
+
+  // Expand + scroll to the show after render
+  setTimeout(() => {
+    const id = 'show-' + seriesName.replace(/[^a-zA-Z0-9]/g, '');
+    const seasonEl = document.getElementById(id);
+    if (!seasonEl) return;
+
+    // Expand first (height changes)
+    if (seasonEl.style.display === 'none' || seasonEl.style.display === '') {
+      toggle(id);
+    }
+
+    // After expansion, re-measure + scroll with header offset
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        // Find show-group container (walk up)
+        let groupEl = seasonEl;
+        for (let i = 0; i < 6; i++) {
+          if (groupEl && groupEl.classList && groupEl.classList.contains('show-group')) break;
+          groupEl = groupEl ? groupEl.parentElement : null;
         }
 
-        filter = 'shows';
-        localStorage.setItem('filter', 'shows');
-        viewMode_shows = 'list';
-        localStorage.setItem('viewMode_shows', 'list');
+        const target = groupEl || seasonEl;
 
-        // Reset view toggle buttons to reflect list mode
-        document.querySelectorAll('.view-toggle button').forEach(b=>b.classList.remove('active'));
-        document.querySelector('.view-toggle button:first-child').classList.add('active');
+        const header = document.querySelector('.header');
+        const headerOffset = header ? header.getBoundingClientRect().height + 12 : 120;
 
-        // Clear the search input so the show appears in the list
-        const searchInput = document.getElementById('search');
-        if(searchInput){
-          // Only clear if it currently has text; this prevents unnecessary
-          // re-render when no search term is present
-          if(searchInput.value){
-            searchInput.value = '';
-          }
-        }
+        const rect = target.getBoundingClientRect();
+        const y = window.scrollY + rect.top - headerOffset;
 
-        // Render history with the updated filter and view
-        renderHistory();
-        // After rendering, expand the show if collapsed and scroll to its
-        // header.  The seasons-list element has id "show-{slug}", but the
-        // show header lives two levels up.  We toggle the seasons list
-        // open if necessary so that scrollIntoView positions correctly.
-        setTimeout(() => {
-          const id = 'show-' + seriesName.replace(/[^a-zA-Z0-9]/g, '');
-          const seasonEl = document.getElementById(id);
-          if(seasonEl){
-            // Expand the show if it's currently collapsed
-            if(seasonEl.style.display === 'none' || seasonEl.style.display === ''){
-              toggle(id);
-            }
-            // Ascend to the show-group container.  The hierarchy is:
-            // seasons-list -> action-buttons -> item-content -> show-group
-            let groupEl = seasonEl;
-            for(let i=0; i<3; i++){
-              if(groupEl && groupEl.parentElement){
-                groupEl = groupEl.parentElement;
-              }
-            }
-            if(groupEl){
-              groupEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
-            } else {
-              seasonEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
-            }
-          }
-        }, 100);
-      }
+        window.scrollTo({ top: y, behavior: 'smooth' });
+      });
+    });
+  }, 50);
+}
+
+function gridMovieClick(movieName, movieYear) {
+  navigateToMovie(movieName, movieYear);
 }
 
 function switchTab(e,t){
@@ -3069,15 +4845,23 @@ function switchTab(e,t){
     }
     renderHistory();
   }
-  currentTab = t;
+  localStorage.setItem('currentTab', t);
+  setActiveTab(t);
+}
+
+function setActiveTab(t){
+  const tab = t || 'history';
+  currentTab = tab;
   document.querySelectorAll('.tab-btn').forEach(b=>b.classList.remove('active'));
   document.querySelectorAll('.tab-content').forEach(c=>c.classList.remove('active'));
-  e.target.classList.add('active');
-  document.getElementById(t+'-tab').classList.add('active');
-  if(t==='genres')renderGenres();
-  if(t==='analytics')renderAnalytics();
-  if(t==='progress')renderProgress();
-  if(t==='history')renderHistory();
+  const btn = document.querySelector(`.tab-btn[onclick*="'${tab}'"]`) || document.querySelector(`.tab-btn[onclick*="${tab}"]`);
+  if(btn) btn.classList.add('active');
+  const content = document.getElementById(tab+'-tab');
+  if(content) content.classList.add('active');
+  if(tab==='genres')renderGenresLazy();
+  if(tab==='analytics')renderAnalytics();
+  if(tab==='progress')renderProgress();
+  if(tab==='history')renderHistory();
 }
 
 function getLatestShowTimestamp(s){
@@ -3092,7 +4876,82 @@ function getLatestShowTimestamp(s){
   return latest;
 }
 
-function setView(mode,e) {
+function formatTimeAmPm(ts){
+  if(!ts) return '';
+  const d = new Date(ts);
+  if(isNaN(d)) return '';
+  let h = d.getHours();
+  const m = d.getMinutes().toString().padStart(2,'0');
+  const ampm = h >= 12 ? 'PM' : 'AM';
+  h = h % 12;
+  if(h === 0) h = 12;
+  return `${h}:${m} ${ampm}`;
+}
+
+function formatDateTimeAmPm(ts){
+  if(!ts) return '';
+  const d = new Date(ts);
+  if(isNaN(d)) return '';
+  const date = d.toLocaleDateString(undefined,{year:'numeric',month:'short',day:'numeric'});
+  return `${date} ${formatTimeAmPm(ts)}`;
+}
+
+function formatDurationHours(hours){
+  const h = Number(hours);
+  if(!isFinite(h) || h <= 0) return '0h';
+  if(h < 24){
+    const rounded = Math.round(h * 10) / 10;
+    return `${rounded}h`;
+  }
+  const totalDays = Math.floor(h / 24);
+  const years = Math.floor(totalDays / 365);
+  const months = Math.floor((totalDays % 365) / 30);
+  const days = totalDays % 30;
+  const parts = [];
+  if(years) parts.push(`${years}y`);
+  if(months) parts.push(`${months}mo`);
+  if(days || parts.length === 0) parts.push(`${days}d`);
+  return parts.join(' ');
+}
+
+function getLastEpisodeInfo(show){
+  let best = null;
+  for(const season of show.seasons||[]){
+    for(const ep of season.episodes||[]){
+      for(const w of (ep.watches||[])){
+        const t = w && w.timestamp ? Date.parse(w.timestamp) : NaN;
+        if(isNaN(t)) continue;
+        const seasonNum = Number(season.season_number) || 0;
+        const epNum = Number(ep.episode) || 0;
+        const betterByTime = !best || t > best.t;
+        const sameTimeBetterEpisode = best && t === best.t && (
+          seasonNum > best.season ||
+          (seasonNum === best.season && epNum > best.episode)
+        );
+        if(betterByTime || sameTimeBetterEpisode){
+          const epName = ep.name || ep.title || ep.episode_name || ep.episode_title || '';
+          best = { t, season: seasonNum, episode: epNum, name: epName, timestamp: w.timestamp };
+        }
+      }
+    }
+  }
+  return best;
+}
+
+function getTotalPossibleEpisodes(show){
+  if(show && show.tmdb_pending) return 0;
+  const direct = show && show.total_episodes_possible ? show.total_episodes_possible : 0;
+  if(direct && direct > 0) return direct;
+  let sum = 0;
+  let has = false;
+  (show && show.seasons ? show.seasons : []).forEach(season => {
+    const total = season.total_episodes || season.episode_count || 0;
+    if(total > 0){ sum += total; has = true; }
+  });
+  if(has) return sum;
+  return show && show.total_episodes ? show.total_episodes : 0;
+}
+function setView(mode, e) {
   // Save separate view modes for each filter
   if (filter === 'movies') {
     viewMode_movies = mode;
@@ -3107,9 +4966,13 @@ function setView(mode,e) {
     viewMode_incomplete = mode;
     localStorage.setItem('viewMode_incomplete', mode);
   }
-  
-  document.querySelectorAll('.view-toggle button').forEach(b=>b.classList.remove('active'));
-  e.target.classList.add('active');
+
+  document.querySelectorAll('.view-toggle button').forEach(b => b.classList.remove('active'));
+  if (e && e.target) e.target.classList.add('active');
+
+  // IMPORTANT: reset paging when switching list/grid
+  currentPage = 1;
+
   renderHistory();
   showGridSelectButton();
   updateGridBulkBar();
@@ -3261,6 +5124,7 @@ async function submitManualEntry(){
         const j = await r.json();
         if(j.success){
           alert(`✓ Added ${j.added} episodes`);
+          saveState(gridKeyShow(seriesName));
           closeManualEntry();
           location.reload();
         }else{
@@ -3285,6 +5149,7 @@ async function submitManualEntry(){
     });
     const result=await r.json();
     if(result.success){
+      saveState(gridKeyMovie(name, year ? parseInt(year) : null));
       closeManualEntry();
       location.reload();
     }else{
@@ -3307,6 +5172,7 @@ async function submitAddEpisode(){
     return;
   }
   
+  saveState(gridKeyShow(seriesName));
   try{
     const r=await fetch('/api/add_episode',{
       method:'POST',
@@ -3351,6 +5217,7 @@ async function submitAddSeason(){
   
   if(!skipTMDB&&!confirm(`Add ALL episodes from Season ${seasonNum}?`))return;
   
+  saveState(gridKeyShow(seriesName));
   try{
     const r=await fetch('/api/add_season',{
       method:'POST',
@@ -3378,6 +5245,7 @@ async function submitAddSeason(){
 async function markComplete(seriesName){
   if(!confirm(`Mark "${seriesName}" as 100% complete?\\n\\nThis will override the progress bar.`))return;
   
+  saveState(gridKeyShow(seriesName));
   try{
     const r=await fetch('/api/mark_complete',{
       method:'POST',
@@ -3398,6 +5266,7 @@ async function markComplete(seriesName){
 async function markSeasonComplete(seriesName,seasonNum){
   if(!confirm(`Mark "${seriesName}" Season ${seasonNum} as 100% complete?`))return;
   
+  saveState(gridKeyShow(seriesName));
   try{
     const r=await fetch('/api/mark_season_complete',{
       method:'POST',
@@ -3422,7 +5291,15 @@ async function clearTMDBCache(){
     const r=await fetch('/api/clear_tmdb_cache',{method:'POST'});
     const result=await r.json();
     if(result.success){
-      alert('✓ TMDB cache cleared! Refresh to reload.');
+      try { sessionStorage.removeItem('historyCache'); } catch(e) {}
+      try { sessionStorage.removeItem('recsCache'); } catch(e) {}
+      try {
+        if ('caches' in window) {
+          const keys = await caches.keys();
+          await Promise.all(keys.map(k => (k && k.startsWith('watch-tracker-')) ? caches.delete(k) : Promise.resolve()));
+        }
+      } catch (e) {}
+      alert('✓ TMDB cache cleared! Reloading...');
       location.reload();
     }else{
       alert('Failed: '+result.error);
@@ -3554,7 +5431,7 @@ async function importRadarr(){
 
 async function deleteMovie(movieName,movieYear){
   if(!confirm(`Delete ALL watch records for "${movieName}" (${movieYear})?`))return;
-  saveState();
+  saveState(gridKeyMovie(movieName, movieYear));
   
   try{
     const r=await fetch('/api/delete_movie',{
@@ -3575,7 +5452,7 @@ async function deleteMovie(movieName,movieYear){
 
 async function deleteShow(seriesName){
   if(!confirm(`Delete ALL watch records for "${seriesName}"?`))return;
-  saveState();
+  saveState(gridKeyShow(seriesName));
   
   try{
     const r=await fetch('/api/delete_show',{
@@ -3596,7 +5473,7 @@ async function deleteShow(seriesName){
 
 async function deleteSeason(seriesName,seasonNum){
   if(!confirm(`Delete ALL episodes from "${seriesName}" Season ${seasonNum}?`))return;
-  saveState();
+  saveState(gridKeyShow(seriesName));
   
   try{
     const r=await fetch('/api/delete_season',{
@@ -3617,7 +5494,7 @@ async function deleteSeason(seriesName,seasonNum){
 
 async function deleteEpisode(seriesName,seasonNum,episodeNum){
   if(!confirm(`Delete "${seriesName}" S${seasonNum}E${episodeNum}?`))return;
-  saveState();
+  saveState(gridKeyShow(seriesName));
   
   try{
     const r=await fetch('/api/delete_episode',{
@@ -3667,7 +5544,6 @@ function renderHistory(){
   const search=(document.getElementById('search').value||'').toLowerCase();
   const sort=document.getElementById('sort').value;
   
-  // Determine which viewMode to use based on current filter
   let viewMode;
   if (filter === 'movies') {
     viewMode = viewMode_movies;
@@ -3679,7 +5555,6 @@ function renderHistory(){
     viewMode = viewMode_incomplete;
   }
 
-  // Update button states to match current filter's view mode
   document.querySelectorAll('.view-toggle button').forEach(b => b.classList.remove('active'))
   if (viewMode === 'grid') {
       document.querySelectorAll('.view-toggle button')[1].classList.add('active')
@@ -3689,6 +5564,34 @@ function renderHistory(){
   
   let movies=(data.movies||[]).filter(m=>!search||m.name.toLowerCase().includes(search));
   let shows=(data.shows||[]).filter(s=>!search||s.series_name.toLowerCase().includes(search));
+  try {
+    const adv = typeof advancedFilters !== 'undefined' && advancedFilters ? advancedFilters : (JSON.parse(localStorage.getItem('advancedFilters') || '{}') || {});
+    if (adv.genre) {
+      movies = movies.filter(m => (m.genres || []).includes(adv.genre));
+      shows = shows.filter(s => (s.genres || []).includes(adv.genre));
+    }
+    const yf = parseInt(adv.yearFrom, 10);
+    if (!isNaN(yf)) {
+      movies = movies.filter(m => m.year && m.year >= yf);
+      shows = shows.filter(s => s.year && s.year >= yf);
+    }
+    const yt = parseInt(adv.yearTo, 10);
+    if (!isNaN(yt)) {
+      movies = movies.filter(m => m.year && m.year <= yt);
+      shows = shows.filter(s => s.year && s.year <= yt);
+    }
+    // FIX 2: Change 'in_progress' to 'inprogress'
+    if (adv.status === 'completed') {
+      shows = shows.filter(s => s.completion_percentage >= 100);
+    } else if (adv.status === 'inprogress') {
+      shows = shows.filter(s => s.completion_percentage > 0 && s.completion_percentage < 100);
+    }
+    if (adv.type === 'movie') {
+      shows = [];
+    } else if (adv.type === 'show') {
+      movies = [];
+    }
+  } catch(err) { console.error(err); }
   
   if(filter==='movies'){
     shows=[];
@@ -3699,51 +5602,56 @@ function renderHistory(){
     shows=shows.filter(s=>s.completion_percentage<100&&s.has_tmdb_data);
   }
   
+  // FIX 3: Change 'most_watched' to 'mostwatched' and 'incomplete_first' to 'incompletefirst'
   if(sort==='recent'){
     movies.sort((a,b)=>(b.watches[0]?.timestamp||'').localeCompare(a.watches[0]?.timestamp||''));
     shows.sort((a,b)=>getLatestShowTimestamp(b).localeCompare(getLatestShowTimestamp(a)));
   }else if(sort==='oldest'){
     movies.sort((a,b)=>(a.watches[0]?.timestamp||'').localeCompare(b.watches[0]?.timestamp||''));
     shows.sort((a,b)=>getLatestShowTimestamp(a).localeCompare(getLatestShowTimestamp(b)));
-  }else if(sort==='most_watched'){
+  }else if(sort==='mostwatched'){
     movies.sort((a,b)=>b.watch_count-a.watch_count);
     shows.sort((a,b)=>b.total_watches-a.total_watches);
   }else if(sort==='alphabetical'){
     movies.sort((a,b)=>a.name.localeCompare(b.name));
     shows.sort((a,b)=>a.series_name.localeCompare(b.series_name));
-  }else if(sort==='incomplete_first'){
+  }else if(sort==='incompletefirst'){
     shows.sort((a,b)=>a.completion_percentage-b.completion_percentage);
   }
   
-  // ========== ADD THIS PAGINATION SECTION ==========
-  // PAGINATION: Only if performance mode is ON
-  let totalItems = 0;
-  let endIdx = 999999; // No limit by default
-
-  if(performanceMode) {
-    const totalMovies = movies.length;
-    const totalShows = shows.length;
-    totalItems = totalMovies + totalShows;
-  
-    const startIdx = 0;
-    endIdx = currentPage * itemsPerPage;
-  
-    movies = movies.slice(startIdx, endIdx);
-    shows = shows.slice(startIdx, Math.max(0, endIdx - movies.length));
-  }
+  const shouldShowLoadMore = (performanceMode || enableLoadMoreInQuality);
+  const totalMoviesAll = movies.length;
+  const totalShowsAll  = shows.length;
+  const totalItemsAll  = totalMoviesAll + totalShowsAll;
+  let endIdx = totalItemsAll;
+  if (shouldShowLoadMore) endIdx = currentPage * itemsPerPage;
+  const slicedMovies = movies.slice(0, endIdx);
+  const remainingForShows = Math.max(0, endIdx - totalMoviesAll);
+  const slicedShows = shows.slice(0, remainingForShows);
+  movies = slicedMovies;
+  shows = slicedShows;
+  const remainingCount = Math.max(0, totalItemsAll - endIdx);
+  const showLoadMoreButton = shouldShowLoadMore && (remainingCount > 0);
 
 if(viewMode==='grid'){
   let html='<div class="grid-view">';
   
   movies.forEach(m=>{
     const poster=m.poster?`<img src="${m.poster}" class="poster" loading="lazy" decoding="async">`:`<div class="poster-placeholder">🎬</div>`;
-    const movieName=m.name.replace(/'/g,"\\'").replace(/"/g,'&quot;');
+    const movieNameEnc = encodeURIComponent(m.name || '').split("'").join('%27');
+    const yearArg = (m.year === null || m.year === undefined) ? 'null' : m.year;
+    const lastWatch = (m.watches && m.watches[0] && m.watches[0].timestamp) ? m.watches[0].timestamp : '';
+    const lastDateTime = lastWatch ? formatDateTimeAmPm(lastWatch) : '';
     const gkey = gridKeyMovie(m.name, m.year);
+    const gkeyAttr = gkey.replace(/"/g, '&quot;');
+    const gkeyJs = encodeURIComponent(gkey).split("'").join('%27');
     const gsel = selectedGridItems.has(gkey) ? ' grid-selected' : '';
     const gchk = selectedGridItems.has(gkey) ? 'checked' : '';
     const itemJson = JSON.stringify(m).replace(/"/g, '&quot;');
+    const gridOnclick = gridSelectMode ? `event.stopPropagation();toggleGridItemSelection(decodeURIComponent('${gkeyJs}'))` : `gridMovieClick(decodeURIComponent('${movieNameEnc}'),${yearArg})`;
+    const checkboxOnclick = `event.stopPropagation();toggleGridItemSelection(decodeURIComponent('${gkeyJs}'))`;
     
-    html += `<div class="grid-item${gsel}" data-grid-key="${gkey}" onclick="${gridSelectMode ? `event.stopPropagation();toggleGridItemSelection('${gkey.replace(/'/g, '\\\\\\'')}')`  : ''}"><div class="grid-checkbox-wrap"><input type="checkbox" class="grid-select-checkbox" ${gchk} onclick="event.stopPropagation();toggleGridItemSelection('${gkey.replace(/'/g, '\\\\\\'')}')"></div><div class="grid-item-actions"><button class="btn manual small" title="Upload poster" onclick="event.stopPropagation();openPosterModal(${itemJson},'movie')">📷</button><button class="btn danger small" onclick="event.stopPropagation();deleteMovie('${movieName}',${m.year})">✕</button></div><div class="poster-container">${poster}</div><div class="grid-item-title">${m.name}</div><div class="grid-item-info">${m.year||''} • ${m.watch_count}x</div></div>`;
+    html += `<div class="grid-item${gsel}" data-grid-key="${gkeyAttr}" onclick="${gridOnclick}"><div class="grid-checkbox-wrap"><input type="checkbox" class="grid-select-checkbox" ${gchk} onclick="${checkboxOnclick}"></div><div class="grid-item-actions"><button class="btn manual small" title="Upload poster" onclick="event.stopPropagation();openPosterModal(${itemJson},'movie')">📷</button><button class="btn danger small" onclick="event.stopPropagation();deleteMovie(decodeURIComponent('${movieNameEnc}'),${yearArg})">✕</button></div><div class="poster-container">${poster}</div><div class="grid-item-title">${m.name}</div><div class="grid-item-info">${m.year||''} • ${m.watch_count}x</div><div class="grid-item-info">${lastDateTime ? `Last: ${lastDateTime}` : ``}</div></div>`;
   });
   
   shows.forEach(s=>{
@@ -3751,185 +5659,331 @@ if(viewMode==='grid'){
     const comp=s.completion_percentage||0;
     const seasons=s.seasons||[];
     const seasonInfo=seasons.map(se=>`S${se.season_number}`).join(', ');
-    const seriesName=s.series_name.replace(/'/g,"\\'").replace(/"/g,'&quot;');
+    const lastInfo = getLastEpisodeInfo(s);
+    const lastGridDate = formatDateTimeAmPm(lastInfo && lastInfo.timestamp);
+    const lastGrid = lastInfo ? `Last: S${lastInfo.season}E${lastInfo.episode}${lastGridDate ? ` | ${lastGridDate}` : ''}` : ''; 
+    const seriesNameEnc = encodeURIComponent(s.series_name).split("'").join('%27');
     const key = `show|${s.series_name}`;
+    const keyAttr = key.replace(/"/g, '&quot;');
+    const keyJs = encodeURIComponent(key).split("'").join('%27');
     const isSelected = selectedGridItems.has(key);
     const allAdded = s.auto_all_added;
     const gsel = isSelected ? ' grid-selected' : '';
+    const showOnclick = gridSelectMode ? `event.stopPropagation();toggleGridItemSelection(decodeURIComponent('${keyJs}'))` : `gridItemClick(decodeURIComponent('${seriesNameEnc}'),true)`;
+    const showCheckbox = `event.stopPropagation();toggleGridItemSelection(decodeURIComponent('${keyJs}'))`;
     
-    html+=`<div class="grid-item${gsel}" data-grid-key="${key}" onclick="${gridSelectMode ? `event.stopPropagation();toggleGridItemSelection('${key.replace(/'/g,"\\'")}')`  : `gridItemClick('${seriesName}',true)`}">${gridSelectMode ? `<div class="grid-checkbox-wrap"><input type="checkbox" class="grid-select-checkbox" ${isSelected ? 'checked' : ''} onclick="event.stopPropagation();toggleGridItemSelection('${key.replace(/'/g,"\\'")}')" ></div>` : ``}<div class="grid-item-actions"><button class="btn success small" title="Mark completed" onclick="event.stopPropagation();markComplete('${seriesName}')">✓</button><button class="btn danger small" title="Delete show" onclick="event.stopPropagation();deleteShow('${seriesName}')">🗑️</button></div><div class="poster-container">${poster}</div><div class="grid-item-title">${s.series_name}</div><div class="grid-item-info">${seasonInfo}</div><div class="grid-item-info">${allAdded ? `<span class="badge badge-info">All episodes added</span>` : ``} <span class="badge ${comp>=100 ? 'badge-success' : 'badge-warning'}">${comp}%</span></div></div>`;
+    html+=`<div class="grid-item${gsel}" data-grid-key="${keyAttr}" onclick="${showOnclick}">${gridSelectMode ? `<div class="grid-checkbox-wrap"><input type="checkbox" class="grid-select-checkbox" ${isSelected ? 'checked' : ''} onclick="${showCheckbox}" ></div>` : ``}<div class="grid-item-actions"><button class="btn success small" title="Mark completed" onclick="event.stopPropagation();markComplete(decodeURIComponent('${seriesNameEnc}'))">✓</button><button class="btn danger small" title="Delete show" onclick="event.stopPropagation();deleteShow(decodeURIComponent('${seriesNameEnc}'))">🗑️</button></div><div class="poster-container">${poster}</div><div class="grid-item-title">${s.series_name}</div><div class="grid-item-info">${seasonInfo}</div>${lastGrid ? `<div class="grid-item-info">${lastGrid}</div>` : ``}<div class="grid-item-info">${allAdded ? `<span class="badge badge-info">All episodes added</span>` : ``} <span class="badge ${comp>=100 ? 'badge-success' : 'badge-warning'}">${comp}%</span></div></div>`;
   });
   
   html+='</div>';
   
-  // Add Load More button only in performance mode
-  if(performanceMode && totalItems > endIdx) {
-    html += `<div style="text-align:center;padding:30px"><button class="btn manual" onclick="loadMore()" style="font-size:16px;padding:15px 30px">📥 Load More (${totalItems - endIdx} remaining)</button></div>`;
+  if(showLoadMoreButton){
+    html += `<div style="text-align:center;padding:30px">
+      <button class="btn manual" onclick="loadMore()" style="font-size:16px;padding:15px 30px">
+        📥 Load More (${remainingCount} remaining)
+      </button>
+    </div>`;
   }
   
   document.getElementById('content').innerHTML=html||'<div class="loading">No items found</div>';
   updateGridBulkBar();
+  try { injectRatings(); } catch(e) { console.error(e); }
+  try { updateResultsCounter(totalMoviesAll, totalShowsAll); } catch(e) {}
   return;
 }
 
   
-  // LIST VIEW
   let html='';
   movies.forEach(m=>{
-    const poster=m.poster?`<img src="${m.poster}" class="poster" loading="lazy" decoding="async">`:`<div class="poster-placeholder">🎬</div>`;
-    const badge=m.watch_count>1?`<span class="badge badge-success">Rewatched ${m.watch_count}x</span>`:'';
-    const itemJson=JSON.stringify(m).replace(/"/g,'&quot;');
-    const movieName=m.name.replace(/'/g,"\\'");
-    html+=`<div class="movie-item">
-      <div class="poster-container">${poster}
-        <button class="upload-poster-btn" onclick='openPosterModal(${itemJson},"movie")'>📤</button>
+    const poster = m.poster
+      ? `<img src="${m.poster}" class="poster" loading="lazy" decoding="async">`
+      : `<div class="poster-placeholder">🎬</div>`;
+    const itemJson = JSON.stringify(m).replace(/"/g, '&quot;');
+    const movieNameEnc = encodeURIComponent(m.name || '').split("'").join('%27');
+    const yearArg = (m.year === null || m.year === undefined) ? 'null' : m.year;
+    const watchCount = m.watch_count || 0;
+    const lastWatch = (m.watches && m.watches[0] && m.watches[0].timestamp) ? m.watches[0].timestamp : '';
+    const lastDateTime = lastWatch ? formatDateTimeAmPm(lastWatch) : '';
+    const details = `${watchCount} watch${watchCount===1?'':'es'}${lastDateTime ? ` • Last: ${lastDateTime}` : ''}`;
+    const genres = (m.genres || []).join(', ');
+    
+    html += `<div class="movie-item" data-movie-name="${movieNameEnc}">
+      <div class="poster-container">
+        ${poster}
+        <button class="upload-poster-btn" onclick="event.stopPropagation();openPosterModal(${itemJson},'movie')">📤</button>
       </div>
       <div class="item-content">
-        <div class="movie-title">${m.name} ${m.year?'('+m.year+')':''}</div>
-        <div class="movie-details">${badge}</div>
-        <div class="action-buttons manage-actions">
-          <button class="btn danger small" onclick="deleteMovie('${movieName}',${m.year})">🗑️ Delete Movie</button>
+        <div class="movie-title">${m.name}${m.year ? ` (${m.year})` : ''}</div>
+        <div class="movie-details">${details}</div>
+        ${genres ? `<div class="movie-details">${genres}</div>` : ``}
+        <div class="manage-actions">
+          <button class="btn danger small" onclick="event.stopPropagation();deleteMovie(decodeURIComponent('${movieNameEnc}'),${yearArg})">🗑️ Delete Movie</button>
         </div>
       </div>
     </div>`;
   });
   
   shows.forEach(s=>{
-    const poster=s.poster?`<img src="${s.poster}" class="poster" loading="lazy" decoding="async">`:`<div class="poster-placeholder">📺</div>`;
-    const id='show-'+s.series_name.replace(/[^a-zA-Z0-9]/g,'');
-    const comp=s.completion_percentage||0;
-    const seriesName=s.series_name.replace(/'/g,"\\'");
+    const poster = s.poster
+      ? `<img src="${s.poster}" class="poster" loading="lazy" decoding="async">`
+      : `<div class="poster-placeholder">📺</div>`;
+    const itemJson = JSON.stringify(s).replace(/"/g, '&quot;');
+    const seriesNameEnc = encodeURIComponent(s.series_name || '').split("'").join('%27');
+    const safeId = (s.series_name || '').replace(/[^a-zA-Z0-9]/g, '');
+    const showId = `show-${safeId}`;
+    const comp = s.completion_percentage || 0;
+    const compBadge = comp >= 100 ? 'badge-success' : 'badge-warning';
+    const totalPossible = getTotalPossibleEpisodes(s);
+    const totalWatched = s.total_episodes || 0;
+    const detailText = totalPossible
+      ? `${totalWatched}/${totalPossible} episodes watched`
+      : (s.tmdb_pending ? `${totalWatched}/? episodes watched (fetching TMDB totals...)` : `${totalWatched} episodes watched`);
+    const lastInfo = getLastEpisodeInfo(s);
+    const lastDate = formatDateTimeAmPm(lastInfo && lastInfo.timestamp);
+    const lastLine = lastInfo ? `Last watched: S${lastInfo.season}E${lastInfo.episode}${lastInfo.name ? ` - ${lastInfo.name}` : ``}${lastDate ? ` | ${lastDate}` : ''}` : ``;
+    const allAddedBadge = s.auto_all_added ? `<span class="badge badge-info">All episodes added</span>` : ``;
+    const newContentBadge = s.has_new_content ? `<span class="badge badge-alert">New Content</span>` : ``;
     
-    let compBadge='';
-    if(s.manually_completed){
-      compBadge=`<span class="badge badge-success">✓ Complete</span>`;
-    }else if(s.has_tmdb_data){
-      if(comp===100){
-        compBadge=`<span class="badge badge-success">✓ Complete</span>`;
-    }else{
-      const allAdded = s.auto_all_added;
-      compBadge = allAdded
-        ? `<span class="badge badge-info">All episodes added</span> <span class="badge badge-warning">${comp}%</span>`
-        : `<span class="badge badge-warning">${comp}%</span>`;
-      }
-    }else{
-      compBadge=`<span class="badge badge-info">Tracking</span>`;
-    }
-    
-    const itemJson=JSON.stringify(s).replace(/"/g,'&quot;');
-    html+=`<div class="show-group">
-      <div class="poster-container">${poster}
-        <button class="upload-poster-btn" onclick='openPosterModal(${itemJson},"tv")'>📤</button>
-      </div>
-      <div class="item-content">
-        <div class="show-header" onclick="toggle('${id}')">
-          <div style="flex:1">
-            <div class="show-title">${s.series_name}</div>
-            <div class="movie-details">${compBadge} <span class="badge badge-info">${s.total_episodes}/${s.total_episodes_possible} Episodes</span></div>
-            <div class="progress-bar"><div class="progress-fill" style="width:${comp}%"></div></div>
-          </div>
-          <div style="font-size:1.3em">▼</div>
-        </div>
-        <div class="action-buttons manage-actions">
-          <button class="btn manual small" onclick="event.stopPropagation();openAddEpisode('${seriesName}')">➕ Episode</button>
-          <button class="btn manual small" onclick="event.stopPropagation();openAddSeason('${seriesName}')">➕ Season</button>
-          <button class="btn warning small" onclick="event.stopPropagation();markComplete('${seriesName}')">✓ Mark 100%</button>
-          <button class="btn danger small" onclick="event.stopPropagation();deleteShow('${seriesName}')">🗑️ Delete</button>
-        </div>
-        <div class="seasons-list" id="${id}">`;
-    
-    (s.seasons||[]).forEach(season=>{
-      const sid=id+'-s'+season.season_number;
-      const seasonEp=season.episode_count||0;
-      const seasonTotal=season.total_episodes||seasonEp;
-      const seasonPercent=season.completion_percentage||0;
+    let seasonsHtml = '';
+    (s.seasons || []).forEach(season => {
+      const sid = `season-${safeId}-${season.season_number}`;
+      const spct = season.completion_percentage || 0;
+      const spctBadge = spct >= 100 ? 'badge-success' : 'badge-warning';
+      const seasonTitle = season.name || `Season ${season.season_number}`;
+      const seasonTotal = season.total_episodes || season.episode_count || 0;
+      const seasonDetail = seasonTotal ? `${season.episode_count}/${seasonTotal} eps` : `${season.episode_count} eps`;
       
-      let seasonInfo='';
-      if(season.manually_completed){
-        seasonInfo=`<span class="badge badge-success">✓ Complete</span>`;
-      }else if(season.has_tmdb_data&&seasonTotal>0){
-        if(seasonPercent===100){
-          seasonInfo=`<span class="badge badge-info">${seasonEp}/${seasonTotal}</span> <span class="badge badge-success">✓ ${seasonPercent}%</span>`;
-        }else{
-          seasonInfo=`<span class="badge badge-info">${seasonEp}/${seasonTotal}</span> <span class="badge badge-warning">${seasonPercent}%</span>`;
-        }
-      }else{
-        seasonInfo=`<span class="badge badge-info">${seasonEp} watched</span>`;
-      }
-      
-      html+=`<div class="season-group">
-        <div class="season-header" onclick="toggle('${sid}')">
-          <div><span class="season-title">Season ${season.season_number}</span> ${seasonInfo}</div>
-          <div style="font-size:1.1em">▼</div>
-        </div>
-        <div class="action-buttons season-actions">
-          <button class="btn warning small" onclick="event.stopPropagation();markSeasonComplete('${seriesName}',${season.season_number})">✓ Mark 100%</button>
-          <button class="btn danger small" onclick="event.stopPropagation();deleteSeason('${seriesName}',${season.season_number})">🗑️ Delete Season</button>
-        </div>
-        <div class="episodes-list" id="${sid}">`;
-      
-      (season.episodes||[]).forEach(ep=>{
-        const rewatched=ep.watch_count>1?` <span class="badge badge-success">×${ep.watch_count}</span>`:'';
-        const key=`${s.series_name}_${season.season_number}_${ep.episode}`;
-        const isSelected=selectedEpisodes.has(key);
-        const selectedClass=isSelected?' selected':'';
-        const checkboxId=`chk-${key.replace(/[^a-zA-Z0-9]/g,'')}`;
-        html+=`<div class="episode-item${selectedClass}" onclick="event.stopPropagation();">
-          <span><input type="checkbox" class="select-checkbox" id="${checkboxId}" ${isSelected?'checked':''} onclick="event.stopPropagation();toggleEpisodeSelection('${seriesName}',${season.season_number},${ep.episode},event);return false;"> <label for="${checkboxId}" style="cursor:pointer;user-select:none;">E${ep.episode}: ${ep.name}${rewatched}</label></span>
-          <button class="btn danger small delete-btn" onclick="event.stopPropagation();deleteEpisode('${seriesName}',${season.season_number},${ep.episode})">🗑️</button>
+      let episodesHtml = '';
+      (season.episodes || []).forEach(ep => {
+        const key = `${s.series_name}_${season.season_number}_${ep.episode}`;
+        const checkboxId = `chk_${safeId}_${season.season_number}_${ep.episode}`;
+        const isSelected = selectedEpisodes.has(key);
+        const selectedClass = isSelected ? ' selected' : '';
+        const checked = isSelected ? 'checked' : '';
+        const rewatched = ep.watch_count > 1 ? ` <span class="badge badge-info">Rewatched ${ep.watch_count}x</span>` : '';
+        episodesHtml += `<div class="episode-item${selectedClass}" onclick="event.stopPropagation();">
+          <span>
+            <input type="checkbox" class="select-checkbox" id="${checkboxId}" ${checked} onclick="event.stopPropagation();toggleEpisodeSelection(decodeURIComponent('${seriesNameEnc}'),${season.season_number},${ep.episode},event);return false;">
+            <label for="${checkboxId}" style="cursor:pointer;user-select:none;">E${ep.episode}: ${ep.name}${rewatched}</label>
+          </span>
+          <button class="btn danger small delete-btn" onclick="event.stopPropagation();deleteEpisode(decodeURIComponent('${seriesNameEnc}'),${season.season_number},${ep.episode})">🗑️</button>
         </div>`;
       });
-      html+=`</div></div>`;
+      if(!episodesHtml){
+        episodesHtml = `<div class="loading">No episodes</div>`;
+      }
+      
+      seasonsHtml += `<div class="season-group">
+        <div class="season-header" onclick="toggle('${sid}')">
+          <div class="season-title">${seasonTitle}</div>
+          <div style="display:flex;gap:6px;align-items:center;">
+            <span class="badge ${spctBadge}">${spct}%</span>
+            <span class="badge badge-info">${seasonDetail}</span>
+            <button class="btn warning small" onclick="event.stopPropagation();markSeasonComplete(decodeURIComponent('${seriesNameEnc}'),${season.season_number})">✓ Mark 100%</button>
+            <button class="btn danger small" onclick="event.stopPropagation();deleteSeason(decodeURIComponent('${seriesNameEnc}'),${season.season_number})">🗑️ Delete Season</button>
+          </div>
+        </div>
+        <div class="episodes-list" id="${sid}" style="display:none">${episodesHtml}</div>
+      </div>`;
     });
     
-    html+=`</div></div></div>`;
+    html += `<div class="show-group" data-show-name="${seriesNameEnc}">
+      <div class="poster-container">
+        ${poster}
+        <button class="upload-poster-btn" onclick="event.stopPropagation();openPosterModal(${itemJson},'tv')">📤</button>
+      </div>
+      <div class="item-content">
+        <div class="show-header" onclick="toggle('${showId}')">
+          <div>
+            <div class="show-title">${s.series_name}</div>
+            <div class="movie-details">${detailText}</div>
+            ${lastLine ? `<div class="movie-details">${lastLine}</div>` : ``}
+          </div>
+          <div style="display:flex;gap:6px;align-items:center;">
+            ${newContentBadge}
+            ${allAddedBadge}
+            <span class="badge ${compBadge}">${comp}%</span>
+          </div>
+        </div>
+        <div class="progress-bar"><div class="progress-fill" style="width:${Math.min(comp,100)}%"></div></div>
+        <div class="manage-actions" style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap;">
+          <button class="btn manual small" onclick="event.stopPropagation();openAddEpisode(decodeURIComponent('${seriesNameEnc}'))">➕ Episode</button>
+          <button class="btn manual small" onclick="event.stopPropagation();openAddSeason(decodeURIComponent('${seriesNameEnc}'))">➕ Season</button>
+          <button class="btn warning small" onclick="event.stopPropagation();markComplete(decodeURIComponent('${seriesNameEnc}'))">✓ Mark 100%</button>
+          <button class="btn danger small" onclick="event.stopPropagation();deleteShow(decodeURIComponent('${seriesNameEnc}'))">🗑️ Delete</button>
+        </div>
+        <div class="seasons-list" id="${showId}">${seasonsHtml}</div>
+      </div>
+    </div>`;
   });
+
+  if(showLoadMoreButton){
+    html += `<div style="text-align:center;padding:30px">
+      <button class="btn manual" onclick="loadMore()" style="font-size:16px;padding:15px 30px">
+        📥 Load More (${remainingCount} remaining)
+      </button>
+    </div>`;
+  }
   
   document.getElementById('content').innerHTML=html||'<div class="loading">No items found</div>';
+  updateBulkBar();
+  try { injectRatings(); } catch(e) { console.error(e); }
+  try { updateResultsCounter(totalMoviesAll, totalShowsAll); } catch(e) {}
+  try { restoreOpenPanels(); } catch(e) {}
 }
 
-
 function loadMore() {
+  const prevScroll = window.scrollY;
   currentPage++;
   renderHistory();
-  window.scrollTo({
-    top: document.body.scrollHeight - 1000,
-    behavior: 'smooth'
+
+  // keep user roughly in the same place (prevents overshoot feeling)
+  requestAnimationFrame(() => {
+    window.scrollTo({ top: prevScroll, behavior: 'instant' });
   });
 }
 
 async function renderGenres(){
+  const renderToken = ++genreRenderToken;
   const genres=data.genres||[];
   const breakdown=data.genre_breakdown||{};
   
   if(genreChart)genreChart.destroy();
   
-  // Fetch insights
-  let insights = null;
-  try {
-    const insightsResp = await fetch('/api/genre_insights');
-    insights = await insightsResp.json();
-  } catch(e) {
-    console.error('Failed to load insights:', e);
+  const fetchInsights = () => fetchJsonWithTimeout('/api/genre_insights', INSIGHTS_FETCH_TIMEOUT_MS);
+  const insightsPromise = fetchInsights()
+    .then(j => {
+      if(renderToken !== genreRenderToken || currentTab !== 'genres') return insights;
+      insights = (j && typeof j === 'object') ? j : insights;
+      return insights;
+    })
+    .catch(async e => {
+      // One fast retry helps when the tab is opened during a transient reconnect.
+      try {
+        await new Promise(res => setTimeout(res, 350));
+        const j = await fetchInsights();
+        if(renderToken !== genreRenderToken || currentTab !== 'genres') return insights;
+        insights = (j && typeof j === 'object') ? j : insights;
+        return insights;
+      } catch (e2) {
+        if(renderToken === genreRenderToken && currentTab === 'genres'){
+          console.error('Failed to load insights:', (e2 && e2.message) || (e && e.message) || e2 || e);
+        }
+        return insights;
+      }
+    });
+
+  function buildGenreInsightsParts(insights){
+    let combosHtml = '';
+    let moodsHtml = '';
+    if(insights && insights.success) {
+      if(insights.combos && insights.combos.length > 0) {
+        combosHtml += `<div style="background:linear-gradient(135deg,rgba(94,245,224,.13),rgba(94,245,224,.06));padding:14px;border-radius:12px;border:1px solid rgba(94,245,224,.35)">`;
+        combosHtml += `<h3 style="margin:0 0 10px 0;color:#5ef5e0;font-size:0.98em;font-weight:700">Genre Combos You Love</h3>`;
+        insights.combos.forEach(c => {
+          const comboGenres = Array.isArray(c.genres) ? c.genres : [];
+          const comboLabel = comboGenres.join(' + ');
+          const comboParam = encodeURIComponent(comboGenres.join('|'));
+          combosHtml += `<div style="margin:5px 0;font-size:0.9em">
+            <button class="btn secondary small" onclick="filterByComboEncoded('${comboParam}')" style="padding:6px 12px;font-size:0.85em">
+              ${escapeHtml(comboLabel)} (${c.count} items)
+            </button>
+          </div>`;
+        });
+        combosHtml += `</div>`;
+      }
+
+      if(insights.moods && Object.keys(insights.moods).length > 0) {
+        moodsHtml += `<div style="background:linear-gradient(135deg,rgba(255,107,157,.13),rgba(255,107,157,.06));padding:14px;border-radius:12px;border:1px solid rgba(255,107,157,.35)">`;
+        moodsHtml += `<h3 style="margin:0 0 10px 0;color:#ff6b9d;font-size:0.98em;font-weight:700">Mood Explorer</h3>`;
+        const moodIcons = {
+          intense: '⚡',
+          fun: '😄',
+          emotional: '💔',
+          exciting: '🚀',
+          scary: '👻'
+        };
+        for(const [mood, info] of Object.entries(insights.moods)) {
+          const icon = moodIcons[mood] || '🎬';
+          moodsHtml += `<div style="margin:8px 0">
+            <button class="btn secondary small" onclick="filterByMood('${mood}')" style="padding:6px 12px;font-size:0.85em">
+              ${icon} Feeling ${mood}? (${info.count} items)
+            </button>
+          </div>`;
+        }
+        moodsHtml += `</div>`;
+      }
+    }
+    return { combosHtml, moodsHtml };
   }
   
-  // Create side-by-side layout - pie chart bigger, genre list smaller
+  // Genres dashboard layout:
+  // Row 1: recommendations (left) + pie chart (right)
+  // Row 2: genre combos + mood explorer (side by side)
+  // Row 3: full genre list
+  const colsTop = window.innerWidth < 1100 ? '1fr' : 'minmax(0,1fr) 420px';
+  const colsMid = window.innerWidth < 900 ? '1fr' : '1fr 1fr';
   let layoutHtml = `
-      <div style="display:grid;grid-template-columns:0.8fr 550px;gap:30px;margin-bottom:30px">
-      <div id="genre-list-container"></div>
-      <!-- Wrap the chart in a container with a class so we can disable sticky positioning on mobile -->
-      <div class="genre-chart-container" style="position:sticky;top:20px;height:fit-content">
-        <div style="background:rgba(139,156,255,0.05);padding:20px;border-radius:16px;border:2px solid rgba(139,156,255,0.2)">
-          <canvas id="genreChart" width="500" height="500"></canvas>
-        </div>
+    <div style="display:grid;gap:18px;align-items:start">
+      <div id="genres-top" style="display:grid;grid-template-columns:${colsTop};gap:18px;align-items:start">
+        <section style="min-width:0">
+          <div id="recommendations-container" style="background:linear-gradient(180deg,rgba(25,33,60,.86),rgba(17,24,46,.86));padding:14px;border-radius:14px;border:1px solid rgba(139,156,255,.28)">
+            <div class="loading">Loading recommendations...</div>
+          </div>
+        </section>
+        <aside style="position:sticky;top:14px;align-self:start;display:grid;gap:12px;height:fit-content">
+          <div style="background:linear-gradient(180deg,rgba(16,22,40,.92),rgba(11,16,31,.92));padding:14px;border-radius:14px;border:1px solid rgba(139,156,255,.25)">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+              <strong style="font-size:0.95rem">Genre Distribution</strong>
+              <span style="font-size:0.8rem;opacity:0.75">Click chart slices to jump</span>
+            </div>
+            <canvas id="genreChart" width="420" height="420"></canvas>
+          </div>
+        </aside>
       </div>
+
+      <section style="display:grid;grid-template-columns:${colsMid};gap:12px">
+        <div id="genre-combos-container"></div>
+        <div id="genre-moods-container"></div>
+      </section>
+
+      <section style="min-width:0">
+        <div id="genre-list-container" style="display:grid;gap:10px"></div>
+      </section>
     </div>
   `;
   
   document.getElementById('genres-content').innerHTML = layoutHtml;
+
+  // Render the list/chart immediately; combos/moods and recommendations load in the background.
+  try {
+    const combosEl = document.getElementById('genre-combos-container');
+    const moodsEl = document.getElementById('genre-moods-container');
+    if(combosEl) combosEl.innerHTML = `<div class="loading" style="padding:10px 0">Loading genre combos...</div>`;
+    if(moodsEl) moodsEl.innerHTML = `<div class="loading" style="padding:10px 0">Loading moods...</div>`;
+
+    if(combosEl || moodsEl){
+      const insightsTimeout = setTimeout(() => {
+        if(renderToken !== genreRenderToken || currentTab !== 'genres') return;
+        if(combosEl && combosEl.innerHTML && combosEl.innerHTML.includes('Loading genre combos')){
+          combosEl.innerHTML = `<div class="loading" style="padding:10px 0">Genre combos unavailable</div>`;
+        }
+        if(moodsEl && moodsEl.innerHTML && moodsEl.innerHTML.includes('Loading moods')){
+          moodsEl.innerHTML = `<div class="loading" style="padding:10px 0">Mood explorer unavailable</div>`;
+        }
+      }, 6000);
+      insightsPromise.then(insights => {
+        if(renderToken !== genreRenderToken || currentTab !== 'genres') return;
+        const parts = buildGenreInsightsParts(insights);
+        if(combosEl) combosEl.innerHTML = parts.combosHtml || `<div class="loading" style="padding:10px 0">No genre combos available</div>`;
+        if(moodsEl) moodsEl.innerHTML = parts.moodsHtml || `<div class="loading" style="padding:10px 0">No mood data available</div>`;
+      }).finally(() => clearTimeout(insightsTimeout));
+    }
+  } catch(e) {}
   
   // Small delay to ensure canvas is in DOM
   setTimeout(() => {
+    if(renderToken !== genreRenderToken || currentTab !== 'genres') return;
     const canvas = document.getElementById('genreChart');
     if(!canvas) {
       console.error('Canvas not found!');
@@ -4005,78 +6059,32 @@ async function renderGenres(){
   }, 100);
   
   let html='';
-  
-  // Add insights sections at the top
-  if(insights && insights.success) {
-    // The "Genre Trends" section was deemed unnecessary.  We intentionally
-    // skip rendering any trending information here so the genres page
-    // remains focused on the recommendations and your personal genre data.
-    
-    // Genre combos
-    if(insights.combos && insights.combos.length > 0) {
-      html += `<div style="background:rgba(94,245,224,0.1);padding:15px;border-radius:12px;margin-bottom:15px;border-left:4px solid #5ef5e0">`;
-      html += `<h3 style="margin:0 0 10px 0;color:#5ef5e0;font-size:1em">🎬 Genre Combos You Love</h3>`;
-      // Each combo is turned into a button.  Clicking the button will
-      // activate a filter so that the recommendations below show only
-      // movies and shows matching all genres in the combo.
-      insights.combos.forEach(c => {
-        const comboLabel = c.genres.join(' + ');
-        const comboParam = c.genres.join('|');
-        html += `<div style="margin:5px 0;font-size:0.9em">
-          <button class="btn secondary small" onclick="filterByCombo('${comboParam}')" style="padding:6px 12px;font-size:0.85em">
-            ${comboLabel} (${c.count} items)
-          </button>
-        </div>`;
-      });
-      html += `</div>`;
-    }
-    
-    // Mood-based
-    if(insights.moods && Object.keys(insights.moods).length > 0) {
-      html += `<div style="background:rgba(255,107,157,0.1);padding:15px;border-radius:12px;margin-bottom:15px;border-left:4px solid #ff6b9d">`;
-      html += `<h3 style="margin:0 0 10px 0;color:#ff6b9d;font-size:1em">🎭 Recommendations by Mood</h3>`;
-      const moodIcons = {
-        intense: '⚡',
-        fun: '😄',
-        emotional: '💔',
-        exciting: '🚀',
-        scary: '👻'
-      };
-      for(const [mood, info] of Object.entries(insights.moods)) {
-        const icon = moodIcons[mood] || '🎬';
-        html += `<div style="margin:8px 0">
-          <button class="btn secondary small" onclick="filterByMood('` + mood + `')" style="padding:6px 12px;font-size:0.85em">
-            ` + icon + ` Feeling ` + mood + `? (` + info.count + ` items)
-          </button>
-        </div>`;
-      }
-      html += `</div>`;
-    }
-  }
-  
+
   // Genre list
   genres.forEach(g=>{
     const b=breakdown[g.genre]||{movies:[],shows:[]};
-    const movieNames=b.movies.slice(0,3).map(m=>m.name).join(', ');
-    const showNames=b.shows.slice(0,3).map(s=>s.series_name).join(', ');
+    const genreName = String(g.genre || '');
+    const genreKey = genreKeyFromName(genreName);
+    const movieNames=b.movies.slice(0,3).map(m=>escapeHtml(m.name || m.title || 'Unknown')).join(', ');
+    const showNames=b.shows.slice(0,3).map(s=>escapeHtml(s.series_name || s.name || 'Unknown')).join(', ');
     let items='';
     if(movieNames)items+=`<strong>Movies:</strong> ${movieNames}${b.movies.length>3?' & '+(b.movies.length-3)+' more':''}<br>`;
     if(showNames)items+=`<strong>Shows:</strong> ${showNames}${b.shows.length>3?' & '+(b.shows.length-3)+' more':''}`;
     
-    html+=`<div class="genre-item" id="genre-item-${g.genre}">
-      <div class="genre-header" style="cursor:pointer;display:flex;justify-content:space-between;align-items:center" onclick="toggleGenreDetails('${g.genre}')">
-        <div style="display:flex;align-items:center;gap:10px">
-          <span id="genre-arrow-${g.genre}" style="transition:transform 0.3s;display:inline-block">▶</span>
-          <div class="genre-name">${g.genre}</div>
+    html+=`<div class="genre-item" id="genre-item-${genreKey}" style="background:rgba(20,25,45,0.72);border:1px solid rgba(139,156,255,0.2);border-radius:12px;padding:12px">
+      <div class="genre-header" style="cursor:pointer;display:flex;justify-content:space-between;align-items:center;gap:10px" onclick="toggleGenreDetailsByKey('${genreKey}')">
+        <div style="display:flex;align-items:center;gap:10px;min-width:0">
+          <span id="genre-arrow-${genreKey}" style="transition:transform 0.3s;display:inline-block;opacity:0.85">&#9654;</span>
+          <div class="genre-name" style="font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${escapeHtml(genreName)}</div>
         </div>
-        <div class="genre-count">${g.count} items</div>
+        <div class="genre-count" style="font-size:0.82rem;padding:4px 10px;border-radius:999px;background:rgba(139,156,255,0.18);border:1px solid rgba(139,156,255,0.35)">${g.count} items</div>
       </div>
-      <div id="genre-details-${g.genre}" class="genre-items" style="display:none;margin-top:10px">${items||'No items'}</div>
+      <div id="genre-details-${genreKey}" class="genre-items" style="display:none;margin-top:10px;padding-top:10px;border-top:1px solid rgba(255,255,255,0.08)">${items||'No items'}</div>
     </div>`;
   });
   
   document.getElementById('genre-list-container').innerHTML=html||'<div class="loading">No genre data available</div>';
-  
+
   // Reset recommendation offsets and lists when the Genres tab is opened.
   // Each category (movies and shows) maintains its own offset so the
   // user can request additional recommendations independently.  Clear
@@ -4085,14 +6093,37 @@ async function renderGenres(){
   recommendationOffsetShows = 0;
   currentMoviesRecs = [];
   currentShowsRecs = [];
-  loadRecommendations();
+  const recEl = document.getElementById('recommendations-container');
+  if(recEl){
+    recEl.innerHTML = `<div class="loading">Loading recommendations...</div>`;
+  }
+  recommendationsRequestToken += 1;
+  // Trigger recommendations immediately after the genres UI is mounted.
+  setTimeout(() => {
+    if(currentTab === 'genres' && renderToken === genreRenderToken){
+      loadRecommendations();
+    }
+  }, 0);
+}
+
+function renderGenresLazy(){
+  const sig = data && data.sig ? data.sig : null;
+  const hasLayout =
+    !!document.getElementById('genre-list-container') &&
+    !!document.getElementById('recommendations-container');
+  if(hasLayout && genresRenderedSig && sig && genresRenderedSig === sig){
+    return;
+  }
+  genresRenderedSig = sig || 'no-sig';
+  renderGenres();
 }
 
 function scrollToGenre(genre) {
-  const element = document.getElementById(`genre-item-${genre}`);
+  const genreKey = genreKeyFromName(genre);
+  const element = document.getElementById(`genre-item-${genreKey}`);
   if(element) {
     element.scrollIntoView({behavior: 'smooth', block: 'center'});
-    toggleGenreDetails(genre);
+    toggleGenreDetailsByKey(genreKey);
     // Highlight briefly
     element.style.background = 'rgba(139,156,255,0.3)';
     setTimeout(() => {
@@ -4116,27 +6147,13 @@ function filterByMood(mood) {
   // movies and shows.
   recommendationOffsetMovies = 0;
   recommendationOffsetShows = 0;
-  // Expand the relevant genres so the user can see which genres are
-  // associated with the selected mood.  Use the global moodGenreMap
-  // rather than a local copy to avoid duplication.
-  const genres = moodGenreMap[mood] || [];
-  genres.forEach(g => {
-    const element = document.getElementById(`genre-item-${g}`);
-    if(element) {
-      const details = document.getElementById(`genre-details-${g}`);
-      const arrow = document.getElementById(`genre-arrow-${g}`);
-      if(details && details.style.display === 'none') {
-        details.style.display = 'block';
-        arrow.style.transform = 'rotate(90deg)';
-      }
-    }
-  });
-  // Scroll to first genre
-  if(genres.length > 0) {
-    scrollToGenre(genres[0]);
-  }
-  // Finally, reload recommendations to apply the filter
+  // Jump to recommendations and reload to apply the filter.
+  scrollToRecommendations();
   loadRecommendations();
+}
+
+function filterByComboEncoded(encodedComboString) {
+  filterByCombo(genreNameFromKey(encodedComboString));
 }
 
 // Apply a genre-combo filter to recommendations.  The comboString
@@ -4159,31 +6176,20 @@ function filterByCombo(comboString) {
   // This ensures fresh batches of filtered results for both categories.
   recommendationOffsetMovies = 0;
   recommendationOffsetShows = 0;
-  // When selecting a genre combo, we can optionally expand the
-  // corresponding genres in the list for context.  We'll open each
-  // matching genre section.
-  genres.forEach(g => {
-    const element = document.getElementById(`genre-item-${g}`);
-    if(element) {
-      const details = document.getElementById(`genre-details-${g}`);
-      const arrow = document.getElementById(`genre-arrow-${g}`);
-      if(details && details.style.display === 'none') {
-        details.style.display = 'block';
-        arrow.style.transform = 'rotate(90deg)';
-      }
-    }
-  });
-  // Scroll to the first genre in the combo for user context
-  if(genres.length > 0) {
-    scrollToGenre(genres[0]);
-  }
-  // Reload recommendations to apply the filter
+  // Jump to recommendations and reload to apply the filter.
+  scrollToRecommendations();
   loadRecommendations();
 }
 
 function toggleGenreDetails(genre) {
-  const details = document.getElementById(`genre-details-${genre}`);
-  const arrow = document.getElementById(`genre-arrow-${genre}`);
+  return toggleGenreDetailsByKey(genreKeyFromName(genre));
+}
+
+function toggleGenreDetailsByKey(genreKey) {
+  const details = document.getElementById(`genre-details-${genreKey}`);
+  const arrow = document.getElementById(`genre-arrow-${genreKey}`);
+  if(!details) return;
+  const genre = genreNameFromKey(genreKey);
   // Fetch full breakdown from the global data so we can render all movies and shows
   const breakdown = (data && data.genre_breakdown) || {};
   const b = breakdown[genre] || { movies: [], shows: [] };
@@ -4201,7 +6207,7 @@ function toggleGenreDetails(genre) {
       // scrolling within the container.
       contentHtml += '<div style="max-height:200px; overflow-y:auto; padding-left:10px">';
       b.movies.forEach(m => {
-        const title = m.name || m.title || 'Unknown';
+        const title = escapeHtml(m.name || m.title || 'Unknown');
         const year = m.year ? ` (${m.year})` : '';
         // Bolden the movie name so that it stands out better in the list
         contentHtml += `<div style="font-weight:600;margin-bottom:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${title}${year}</div>`;
@@ -4217,7 +6223,7 @@ function toggleGenreDetails(genre) {
     if(b.shows && b.shows.length > 0) {
       contentHtml += '<div style="max-height:200px; overflow-y:auto; padding-left:10px">';
       b.shows.forEach(s => {
-        const title = s.series_name || s.name || 'Unknown';
+        const title = escapeHtml(s.series_name || s.name || 'Unknown');
         const year = s.year ? ` (${s.year})` : '';
         // Bolden the show name so that it stands out better in the list
         contentHtml += `<div style="font-weight:600;margin-bottom:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${title}${year}</div>`;
@@ -4229,21 +6235,122 @@ function toggleGenreDetails(genre) {
     contentHtml += '</div>';
     details.innerHTML = contentHtml;
     details.style.display = 'block';
-    arrow.style.transform = 'rotate(90deg)';
+    if(arrow) arrow.style.transform = 'rotate(90deg)';
   } else {
     // Collapse the details
     details.style.display = 'none';
-    arrow.style.transform = 'rotate(0deg)';
+    if(arrow) arrow.style.transform = 'rotate(0deg)';
   }
 }
 
+function renderRecommendationsPanel(){
+  const recEl = document.getElementById('recommendations-container');
+  if(!recEl) return;
+
+  let heading;
+  if(currentMoodFilter){
+    heading = `🎭 Recommendations for your ${currentMoodFilter} mood`;
+  } else if(currentGenreComboFilter){
+    heading = `🎬 Recommendations: ${currentGenreComboFilter.join(' + ')}`;
+  } else if(lastRecsTopGenre){
+    heading = `🎯 Recommended for you (Based on ${lastRecsTopGenre})`;
+  } else {
+    heading = `🎯 Recommended for you`;
+  }
+
+  const loadingAll = lastRecsLoadingSection === 'all';
+  const loadingMovies = loadingAll || lastRecsLoadingSection === 'movies';
+  const loadingShows  = loadingAll || lastRecsLoadingSection === 'shows';
+
+  let msgHtml = '';
+  if(lastRecsError){
+    msgHtml = `<div style="margin:10px 0 14px 0;padding:10px 12px;border-radius:10px;background:rgba(255,107,157,.10);border:1px solid rgba(255,107,157,.28);color:rgba(255,255,255,0.85);font-size:0.9em">
+      ${escapeHtml(lastRecsError)}
+    </div>`;
+  }
+
+  const moviesBtnDisabled = loadingMovies ? 'disabled' : '';
+  const showsBtnDisabled  = loadingShows ? 'disabled' : '';
+
+  let recHtml = ``;
+  recHtml += `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
+    <h3 style="margin:0;color:#8b9cff">${heading}</h3>
+  </div>`;
+  recHtml += msgHtml;
+  recHtml += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:20px">';
+
+  // Movies column
+  recHtml += '<div style="display:flex;flex-direction:column">';
+  recHtml += `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+    <h4 style="margin:0;color:rgba(255,255,255,0.8)">🎬 Movies</h4>
+    <button class="btn secondary small" onclick="refreshMovieRecommendations()" ${moviesBtnDisabled} style="padding:6px 12px;${loadingMovies ? 'opacity:.65;cursor:default;' : ''}">🔄 More Movies${loadingMovies ? ' ⏳' : ''}</button>
+  </div>`;
+  if(loadingMovies && currentMoviesRecs.length === 0){
+    recHtml += '<div class="loading">Loading movies...</div>';
+  } else if(currentMoviesRecs.length === 0) {
+    if(currentMoodFilter || currentGenreComboFilter) {
+      recHtml += '<p style="color:rgba(255,255,255,0.5)">No movies match this selection</p>';
+    } else if(recommendationOffsetMovies === 0) {
+      recHtml += '<p style="color:rgba(255,255,255,0.5)">No unwatched movies found in Radarr</p>';
+    } else {
+      recHtml += '<p style="color:rgba(255,255,255,0.5)">No more movies to show</p>';
+    }
+  } else {
+    currentMoviesRecs.forEach(m => {
+      recHtml += `<div style="background:rgba(20,25,45,0.8);padding:15px;border-radius:12px;margin-bottom:10px;border-left:3px solid #ff8585">
+        <div style="font-weight:700;margin-bottom:5px">${escapeHtml(m.title || '')} ${m.year ? '('+escapeHtml(String(m.year))+')' : ''}</div>
+        <div style="font-size:0.85em;color:rgba(255,255,255,0.6);margin-bottom:8px">${escapeHtml(m.overview || '')}</div>
+        <div>${(m.genres||[]).slice(0,3).map(g => `<span class="badge badge-info">${escapeHtml(g)}</span>`).join(' ')}</div>
+      </div>`;
+    });
+  }
+  recHtml += '</div>';
+
+  // Shows column
+  recHtml += '<div style="display:flex;flex-direction:column">';
+  recHtml += `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+    <h4 style="margin:0;color:rgba(255,255,255,0.8)">📺 Shows</h4>
+    <button class="btn secondary small" onclick="refreshShowRecommendations()" ${showsBtnDisabled} style="padding:6px 12px;${loadingShows ? 'opacity:.65;cursor:default;' : ''}">🔄 More Shows${loadingShows ? ' ⏳' : ''}</button>
+  </div>`;
+  if(loadingShows && currentShowsRecs.length === 0){
+    recHtml += '<div class="loading">Loading shows...</div>';
+  } else if(currentShowsRecs.length === 0) {
+    if(currentMoodFilter || currentGenreComboFilter) {
+      recHtml += '<p style="color:rgba(255,255,255,0.5)">No shows match this selection</p>';
+    } else if(recommendationOffsetShows === 0) {
+      recHtml += '<p style="color:rgba(255,255,255,0.5)">No unwatched shows found in Sonarr</p>';
+    } else {
+      recHtml += '<p style="color:rgba(255,255,255,0.5)">No more shows to show</p>';
+    }
+  } else {
+    currentShowsRecs.forEach(s => {
+      recHtml += `<div style="background:rgba(20,25,45,0.8);padding:15px;border-radius:12px;margin-bottom:10px;border-left:3px solid #5ef5e0">
+        <div style="font-weight:700;margin-bottom:5px">${escapeHtml(s.title || '')} ${s.year ? '('+escapeHtml(String(s.year))+')' : ''}</div>
+        <div style="font-size:0.85em;color:rgba(255,255,255,0.6);margin-bottom:8px">${escapeHtml(s.overview || '')}</div>
+        <div>${(s.genres||[]).slice(0,3).map(g => `<span class="badge badge-info">${escapeHtml(g)}</span>`).join(' ')}</div>
+      </div>`;
+    });
+  }
+  recHtml += '</div>';
+  recHtml += '</div>';
+
+  recEl.innerHTML = recHtml;
+}
+
 async function loadRecommendations(section) {
+  // On first paint, show cached recs instantly if available.
+  if((!currentMoviesRecs || currentMoviesRecs.length === 0) && (!currentShowsRecs || currentShowsRecs.length === 0)){
+    const cached = getCachedRecs();
+    if(cached && cached.success){
+      lastRecsTopGenre = cached.top_genre || lastRecsTopGenre;
+      if(Array.isArray(cached.movies)) currentMoviesRecs = cached.movies;
+      if(Array.isArray(cached.shows)) currentShowsRecs = cached.shows;
+      try { renderRecommendationsPanel(); } catch(e) {}
+    }
+  }
+
   try {
-    // Determine which offset to use based on the requested section.  When a
-    // specific section is provided ('movies' or 'shows'), use that
-    // category's offset to fetch a new batch of suggestions.  When
-    // section is undefined (initial load or full refresh), use the
-    // maximum of the two offsets so that both categories remain in sync.
+    const reqToken = ++recommendationsRequestToken;
     let offset;
     if(section === 'movies') {
       offset = recommendationOffsetMovies;
@@ -4252,121 +6359,65 @@ async function loadRecommendations(section) {
     } else {
       offset = Math.max(recommendationOffsetMovies, recommendationOffsetShows);
     }
-    const resp = await fetch(`/api/genre_recommendations?offset=${offset}`);
-    const recs = await resp.json();
-    
-    if(recs.success && recs.top_genre) {
-      // Build filtered movie and show lists based on active mood or combo filters.
-      let movies = Array.isArray(recs.movies) ? [...recs.movies] : [];
-      let shows = Array.isArray(recs.shows) ? [...recs.shows] : [];
-      let heading;
-      if(currentMoodFilter) {
-        const mg = moodGenreMap[currentMoodFilter] || [];
-        const mgLower = mg.map(x => (x || '').toLowerCase());
-        movies = movies.filter(m => {
-          const gs = (m.genres || []).map(x => (x || '').toLowerCase());
-          return gs.some(g => mgLower.includes(g));
-        });
-        shows = shows.filter(s => {
-          const gs = (s.genres || []).map(x => (x || '').toLowerCase());
-          return gs.some(g => mgLower.includes(g));
-        });
-        heading = `🎭 Recommendations for your ${currentMoodFilter} mood`;
-      } else if(currentGenreComboFilter) {
-        movies = movies.filter(m => {
-          const gs = (m.genres || []).map(x => (x || '').toLowerCase());
-          return currentGenreComboFilter.every(g => gs.includes((g || '').toLowerCase()));
-        });
-        shows = shows.filter(s => {
-          const gs = (s.genres || []).map(x => (x || '').toLowerCase());
-          return currentGenreComboFilter.every(g => gs.includes((g || '').toLowerCase()));
-        });
-        heading = `🎬 Recommendations: ${currentGenreComboFilter.join(' + ')}`;
-      } else {
-        heading = `🎯 Recommended for you (Based on ${recs.top_genre})`;
-      }
-      // Update stored recommendations only for the requested section (or both if
-      // section is undefined).  This allows the user to refresh movies or
-      // shows independently without overwriting the other category.
-      if(!section || section === 'movies') {
-        currentMoviesRecs = movies;
-      }
-      if(!section || section === 'shows') {
-        currentShowsRecs = shows;
-      }
-      let recHtml = `<div id="recommendations-container" style="margin-top:30px;padding:20px;background:rgba(139,156,255,0.1);border-radius:16px;border:2px solid rgba(139,156,255,0.3)">`;
-      // Heading row
-      recHtml += `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px">
-        <h3 style="margin:0;color:#8b9cff">${heading}</h3>
-      </div>`;
-      recHtml += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:20px">';
-      // Movies column
-      recHtml += '<div style="display:flex;flex-direction:column">';
-      // Header row with a more button placed on the right so it appears above the list
-      recHtml += `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
-        <h4 style="margin:0;color:rgba(255,255,255,0.8)">🎬 Movies</h4>
-        <button class="btn secondary small" onclick="refreshMovieRecommendations()" style="padding:6px 12px">🔄 More Movies</button>
-      </div>`;
-      if(currentMoviesRecs.length === 0) {
-        // Determine which message to show based on filters and offsets
-        if(currentMoodFilter || currentGenreComboFilter) {
-          recHtml += '<p style="color:rgba(255,255,255,0.5)">No movies match this selection</p>';
-        } else if(recommendationOffsetMovies === 0) {
-          recHtml += '<p style="color:rgba(255,255,255,0.5)">No unwatched movies found in Radarr</p>';
-        } else {
-          recHtml += '<p style="color:rgba(255,255,255,0.5)">No more movies to show</p>';
-        }
-      } else {
-        currentMoviesRecs.forEach(m => {
-          recHtml += `<div style="background:rgba(20,25,45,0.8);padding:15px;border-radius:12px;margin-bottom:10px;border-left:3px solid #ff8585">
-            <div style="font-weight:700;margin-bottom:5px">${m.title} ${m.year ? '('+m.year+')' : ''}</div>
-            <div style="font-size:0.85em;color:rgba(255,255,255,0.6);margin-bottom:8px">${m.overview}</div>
-            <div>${(m.genres||[]).slice(0,3).map(g => `<span class="badge badge-info">${g}</span>`).join(' ')}</div>
-          </div>`;
-        });
-      }
-      // close movies column
-      recHtml += '</div>';
-      // Shows column
-      recHtml += '<div style="display:flex;flex-direction:column">';
-      // Header row with a more button on the right for shows
-      recHtml += `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
-        <h4 style="margin:0;color:rgba(255,255,255,0.8)">📺 Shows</h4>
-        <button class="btn secondary small" onclick="refreshShowRecommendations()" style="padding:6px 12px">🔄 More Shows</button>
-      </div>`;
-      if(currentShowsRecs.length === 0) {
-        if(currentMoodFilter || currentGenreComboFilter) {
-          recHtml += '<p style="color:rgba(255,255,255,0.5)">No shows match this selection</p>';
-        } else if(recommendationOffsetShows === 0) {
-          recHtml += '<p style="color:rgba(255,255,255,0.5)">No unwatched shows found in Sonarr</p>';
-        } else {
-          recHtml += '<p style="color:rgba(255,255,255,0.5)">No more shows to show</p>';
-        }
-      } else {
-        currentShowsRecs.forEach(s => {
-          recHtml += `<div style="background:rgba(20,25,45,0.8);padding:15px;border-radius:12px;margin-bottom:10px;border-left:3px solid #5ef5e0">
-            <div style="font-weight:700;margin-bottom:5px">${s.title} ${s.year ? '('+s.year+')' : ''}</div>
-            <div style="font-size:0.85em;color:rgba(255,255,255,0.6);margin-bottom:8px">${s.overview}</div>
-            <div>${(s.genres||[]).slice(0,3).map(g => `<span class="badge badge-info">${g}</span>`).join(' ')}</div>
-          </div>`;
-        });
-      }
-      recHtml += '</div>';
-      recHtml += '</div>';
-      recHtml += '</div>';
-      // Remove old recommendations if they exist
-      const oldRecs = document.getElementById('recommendations-container');
-      if(oldRecs) oldRecs.remove();
-      // Append the new recommendations container without re-rendering the entire
-      // genres page.  Using insertAdjacentHTML avoids resetting the DOM and
-      // inadvertently destroying the pie chart.
-      const genresContainer = document.getElementById('genres-content');
-      if(genresContainer) {
-        genresContainer.insertAdjacentHTML('beforeend', recHtml);
-      }
+
+    lastRecsError = null;
+    lastRecsLoadingSection = section || 'all';
+    renderRecommendationsPanel();
+
+    const recs = await fetchJsonWithTimeout(`/api/genre_recommendations?offset=${offset}`, RECS_FETCH_TIMEOUT_MS);
+    if(reqToken !== recommendationsRequestToken || currentTab !== 'genres') return;
+
+    if(!recs || !recs.success) {
+      lastRecsError = 'Recommendations temporarily unavailable (server busy)';
+      lastRecsLoadingSection = null;
+      renderRecommendationsPanel();
+      return;
     }
+
+    if(!recs.top_genre) {
+      lastRecsTopGenre = null;
+      lastRecsError = (currentMoodFilter || currentGenreComboFilter)
+        ? 'No recommendations match this selection'
+        : 'No recommendations available yet';
+      lastRecsLoadingSection = null;
+      renderRecommendationsPanel();
+      return;
+    }
+
+    lastRecsTopGenre = recs.top_genre;
+    storeCachedRecs(recs);
+
+    let movies = Array.isArray(recs.movies) ? [...recs.movies] : [];
+    let shows = Array.isArray(recs.shows) ? [...recs.shows] : [];
+
+    if(currentMoodFilter) {
+      const mg = moodGenreMap[currentMoodFilter] || [];
+      const mgLower = mg.map(x => (x || '').toLowerCase());
+      movies = movies.filter(m => ((m.genres||[]).map(x => (x||'').toLowerCase())).some(g => mgLower.includes(g)));
+      shows = shows.filter(s => ((s.genres||[]).map(x => (x||'').toLowerCase())).some(g => mgLower.includes(g)));
+    } else if(currentGenreComboFilter) {
+      movies = movies.filter(m => {
+        const gs = (m.genres || []).map(x => (x || '').toLowerCase());
+        return currentGenreComboFilter.every(g => gs.includes((g || '').toLowerCase()));
+      });
+      shows = shows.filter(s => {
+        const gs = (s.genres || []).map(x => (x || '').toLowerCase());
+        return currentGenreComboFilter.every(g => gs.includes((g || '').toLowerCase()));
+      });
+    }
+
+    if(!section || section === 'movies') currentMoviesRecs = movies;
+    if(!section || section === 'shows') currentShowsRecs = shows;
+
+    lastRecsError = null;
+    lastRecsLoadingSection = null;
+    renderRecommendationsPanel();
   } catch(e) {
-    console.error('Failed to load recommendations:', e);
+    if(currentTab !== 'genres') return;
+    console.error('Failed to load recommendations:', (e && e.message) ? e.message : e);
+    lastRecsError = 'Recommendations temporarily unavailable (network slow)';
+    lastRecsLoadingSection = null;
+    try { renderRecommendationsPanel(); } catch(_) {}
   }
 }
 
@@ -4382,6 +6433,7 @@ function refreshRecommendations() {
 // the movie offset and calls loadRecommendations() specifying the
 // 'movies' section so that only the movies list is refreshed.
 function refreshMovieRecommendations() {
+  if(lastRecsLoadingSection) return;
   recommendationOffsetMovies++;
   loadRecommendations('movies');
 }
@@ -4391,6 +6443,7 @@ function refreshMovieRecommendations() {
 // the show offset and calls loadRecommendations() specifying the
 // 'shows' section so that only the shows list is refreshed.
 function refreshShowRecommendations() {
+  if(lastRecsLoadingSection) return;
   recommendationOffsetShows++;
   loadRecommendations('shows');
 }
@@ -4405,7 +6458,11 @@ function renderAnalytics(){
   statsHtml+=`<div class="quick-stat-card"><div class="quick-stat-title">🏆 Longest Streak</div><div class="quick-stat-value">${streak.longest}</div><div class="quick-stat-label">days</div></div>`;
   statsHtml+=`<div class="quick-stat-card"><div class="quick-stat-title">🔁 Most Rewatched</div><div class="quick-stat-value">${quick.most_rewatched?.count||0}x</div><div class="quick-stat-label">${quick.most_rewatched?.name||'N/A'}</div></div>`;
   statsHtml+=`<div class="quick-stat-card"><div class="quick-stat-title">🍿 Most Binged</div><div class="quick-stat-value">${quick.most_binged?.count||0}</div><div class="quick-stat-label">${quick.most_binged?.name||'N/A'}</div></div>`;
-  statsHtml+=`<div class="quick-stat-card"><div class="quick-stat-title">⚡ Fastest Completion</div><div class="quick-stat-value">${quick.fastest_completion?.days||0}</div><div class="quick-stat-label">${quick.fastest_completion?.name||'N/A'}</div></div>`;
+  // Display fastest completion in days. If no show qualifies (days === 0 or undefined) then show 'N/A'.
+  const fcDays = quick.fastest_completion?.days;
+  const fcName = quick.fastest_completion?.name || 'N/A';
+  const fcDisplay = fcDays && fcDays > 0 ? fcDays : 'N/A';
+  statsHtml+=`<div class="quick-stat-card"><div class="quick-stat-title">⚡ Fastest Completion</div><div class="quick-stat-value">${fcDisplay}</div><div class="quick-stat-label">${fcName}</div></div>`;
   statsHtml+=`<div class="quick-stat-card"><div class="quick-stat-title">📺 Avg Episodes/Day</div><div class="quick-stat-value">${quick.avg_episodes_per_day||0}</div><div class="quick-stat-label">episodes</div></div>`;
   
   document.getElementById('quick-stats').innerHTML=statsHtml;
@@ -4429,6 +6486,9 @@ function renderAnalytics(){
   }
   trendingHtml+='</div></div>';
   document.getElementById('trending-content').innerHTML=trendingHtml;
+
+  // Render watch time analytics chart and summary
+  try { renderWatchTime(); } catch(e) { console.error(e); }
 }
 
 function renderProgress(){
@@ -4470,7 +6530,7 @@ function renderProgress(){
         }
       });
     }
-    const totalPossible=s.total_episodes_possible||0;
+    const totalPossible = getTotalPossibleEpisodes(s);
     const totalWatched=s.total_episodes||0;
     const episodesLeft=Math.max(0,totalPossible-totalWatched);
     return {...s,lastWatched,episodesLeft};
@@ -4596,7 +6656,7 @@ function renderProgress(){
         showsHtml += `<div style="display:grid;gap:10px">`;
         visibleInProgress.forEach(s => {
           const comp = s.completion_percentage || 0;
-          const totalPossible = s.total_episodes_possible || 0;
+          const totalPossible = getTotalPossibleEpisodes(s);
           const totalWatched = s.total_episodes || 0;
           const episodesLeft = s.episodesLeft != null ? s.episodesLeft : Math.max(0, totalPossible - totalWatched);
           let detailText = '';
@@ -4636,7 +6696,7 @@ function renderProgress(){
         showsHtml += `<div style="display:grid;gap:10px">`;
         visibleCompleted.forEach(s => {
           const comp = s.completion_percentage || 100;
-          const totalPossible = s.total_episodes_possible || 0;
+          const totalPossible = getTotalPossibleEpisodes(s);
           const totalWatched = s.total_episodes || 0;
           const episodesLeft = s.episodesLeft != null ? s.episodesLeft : Math.max(0, totalPossible - totalWatched);
           let detailText = '';
@@ -4746,6 +6806,7 @@ function setFilter(f,e){
   }
   document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
   e.target.classList.add('active');
+  currentPage = 1;
   renderHistory();
 }
 
@@ -4854,7 +6915,7 @@ function loadMoreCompletedShows(){
 // search box with the movie name and then re-render the history view.
 // This allows the user to quickly jump to the detailed view for a
 // particular film without manually searching.
-function navigateToMovie(movieName){
+function navigateToMovie(movieName, movieYear){
   // Ensure the history tab is active
   const historyBtn = document.querySelector(".tab-btn[onclick*='history']");
   if(historyBtn){
@@ -4874,8 +6935,27 @@ function navigateToMovie(movieName){
   }
   // Re-render the history view to apply filter and search
   renderHistory();
-  // Scroll to the top of the page so the user sees the results
-  window.scrollTo({ top: 0, behavior: 'smooth' });
+  // After render, scroll to the specific movie item if possible
+  setTimeout(() => {
+    let target = null;
+    document.querySelectorAll('.movie-item').forEach(item => {
+      const enc = item.getAttribute('data-movie-name');
+      const name = enc ? decodeURIComponent(enc) : (item.querySelector('.movie-title')?.textContent || '').split(' (')[0];
+      if (name === movieName) {
+        if (movieYear === undefined || movieYear === null) {
+          target = item;
+        } else {
+          const titleText = item.querySelector('.movie-title')?.textContent || '';
+          if (titleText.includes(`(${movieYear})`)) target = item;
+        }
+      }
+    });
+    if (target) {
+      target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    } else {
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    }
+  }, 120);
 }
 
     // Navigate to a specific show within the library.  This function is
@@ -4961,6 +7041,456 @@ zoomSlider.addEventListener('input', function(){
   applyZoomPercent(parseInt(this.value, 10));
 });
 
+/* === Advanced Feature Scripts === */
+// Render rating stars HTML
+function escapeHtml(str){
+  return (str || '')
+    .replace(/&/g,'&amp;')
+    .replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;')
+    .replace(/'/g,'&#39;');
+}
+
+function renderRatingHTML(current, itemKey, note) {
+  let stars = '';
+  for (let i = 1; i <= 5; i++) {
+    const filled = current && i <= current ? 'filled' : '';
+    stars += `<span class="star ${filled}" onclick="rateItem('${itemKey}', ${i}, event)">★</span>`;
+  }
+  const safeNote = escapeHtml(note || '');
+  const noteHtml = safeNote ? `<div class="rating-note">${safeNote}</div>` : '';
+  return `<div class="rating-wrap"><div class="rating">${stars}</div>${noteHtml}</div>`;
+}
+
+// Rate an item (movie or show)
+function rateItem(key, rating, event) {
+  if (event && event.stopPropagation) event.stopPropagation();
+  let existingNote = '';
+  if (key.startsWith('show|')) {
+    const show = (data.shows || []).find(s => ('show|' + s.series_name) === key);
+    existingNote = show && show.note ? show.note : '';
+  } else {
+    (data.movies || []).forEach(m => {
+      if (gridKeyMovie(m.name, m.year) === key) {
+        if (m.note) existingNote = m.note;
+      }
+    });
+  }
+  const note = prompt('Optional note:', existingNote) || '';
+  fetch('/api/rate', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id: key, rating: rating, note: note })
+  }).then(r => r.json()).then(j => {
+    if (j && j.success) {
+      if (key.startsWith('show|')) {
+        const show = data.shows.find(s => ('show|' + s.series_name) === key);
+        if (show) { show.rating = rating; show.note = note; }
+      } else {
+        data.movies.forEach(m => {
+          if (gridKeyMovie(m.name, m.year) === key) {
+            m.rating = rating;
+            m.note = note;
+          }
+        });
+      }
+      renderHistory();
+    } else {
+      alert('Rating failed: ' + ((j && j.error) || 'Unknown error'));
+    }
+  }).catch(e => alert('Rating error: ' + e));
+}
+
+// Inject rating stars into grid and list views
+function injectRatings() {
+  // Grid view
+  document.querySelectorAll('.grid-item').forEach(item => {
+    const key = item.getAttribute('data-grid-key');
+    if (!key) return;
+    let currentRating = null;
+    let currentNote = '';
+    if (key.startsWith('show|')) {
+      const show = (data.shows || []).find(s => ('show|' + s.series_name) === key);
+      currentRating = show && show.rating;
+      currentNote = show && show.note ? show.note : '';
+    } else {
+      const movie = (data.movies || []).find(m => gridKeyMovie(m.name, m.year) === key);
+      currentRating = movie && movie.rating;
+      currentNote = movie && movie.note ? movie.note : '';
+    }
+    const existing = item.querySelector('.rating-wrap') || item.querySelector('.rating');
+    if (existing) existing.remove();
+    const infoEl = item.querySelector('.grid-item-info');
+    const ratingHTML = renderRatingHTML(currentRating, key, currentNote);
+    const temp = document.createElement('div');
+    temp.innerHTML = ratingHTML;
+    const el = temp.firstElementChild;
+    if (infoEl && infoEl.parentNode) {
+      infoEl.parentNode.insertBefore(el, infoEl.nextSibling);
+    } else {
+      item.appendChild(el);
+    }
+  });
+  // Movie list
+  document.querySelectorAll('.movie-item').forEach(item => {
+    const titleEl = item.querySelector('.movie-title');
+    if (!titleEl) return;
+    const text = titleEl.textContent;
+    const match = text.match(/^(.*?)(?:\\s*\\((\\d{4})\\))?$/);
+    const name = match ? match[1].trim() : text.trim();
+    const year = match && match[2] ? parseInt(match[2], 10) : null;
+    let key = null;
+    let rating = null;
+    let note = '';
+    (data.movies || []).forEach(m => {
+      if (m.name === name && (!year || m.year == year)) {
+        key = gridKeyMovie(m.name, m.year);
+        rating = m.rating;
+        note = m.note || '';
+      }
+    });
+    if (!key) return;
+    const existing = item.querySelector('.rating-wrap') || item.querySelector('.rating');
+    if (existing) existing.remove();
+    const ratingHTML = renderRatingHTML(rating, key, note);
+    const temp = document.createElement('div');
+    temp.innerHTML = ratingHTML;
+    titleEl.parentNode.insertBefore(temp.firstElementChild, titleEl.nextSibling);
+  });
+  // Show list
+  document.querySelectorAll('.show-group').forEach(group => {
+    const header = group.querySelector('.show-title');
+    if (!header) return;
+    const seriesName = header.textContent;
+    const key = 'show|' + seriesName;
+    const show = (data.shows || []).find(s => s.series_name === seriesName);
+    const rating = show && show.rating;
+    const note = show && show.note ? show.note : '';
+    const existing = group.querySelector('.rating-wrap') || group.querySelector('.rating');
+    if (existing) existing.remove();
+    const ratingHTML = renderRatingHTML(rating, key, note);
+    const temp = document.createElement('div');
+    temp.innerHTML = ratingHTML;
+    header.parentNode.insertBefore(temp.firstElementChild, header.nextSibling);
+  });
+}
+
+// Advanced filters state
+let advancedFilters = { genre: '', yearFrom: '', yearTo: '', status: '', type: 'all' };
+function applyFilters() {
+  advancedFilters.genre = document.getElementById('genreFilter').value;
+  advancedFilters.yearFrom = document.getElementById('yearFrom').value;
+  advancedFilters.yearTo = document.getElementById('yearTo').value;
+  advancedFilters.status = document.getElementById('statusFilter').value;
+  advancedFilters.type = document.getElementById('typeFilter').value;
+  localStorage.setItem('advancedFilters', JSON.stringify(advancedFilters));
+  currentPage = 1;
+  renderHistory();
+}
+
+function clearFilters() {
+  document.getElementById('genreFilter').value = '';
+  document.getElementById('yearFrom').value = '';
+  document.getElementById('yearTo').value = '';
+  document.getElementById('statusFilter').value = '';
+  document.getElementById('typeFilter').value = 'all';
+  applyFilters();
+}
+
+function populateGenreFilter() {
+  const select = document.getElementById('genreFilter');
+  if (!select) return;
+  while (select.options.length > 1) select.remove(1);
+  (data.genres || []).forEach(g => {
+    const opt = document.createElement('option');
+    opt.value = g.genre;
+    opt.textContent = g.genre;
+    select.appendChild(opt);
+  });
+  try {
+    const saved = JSON.parse(localStorage.getItem('advancedFilters') || '{}');
+    if (saved) {
+      advancedFilters = saved;
+      if (saved.genre) select.value = saved.genre;
+      const yfEl = document.getElementById('yearFrom');
+      if (yfEl) yfEl.value = saved.yearFrom || '';
+      const ytEl = document.getElementById('yearTo');
+      if (ytEl) ytEl.value = saved.yearTo || '';
+      const sfEl = document.getElementById('statusFilter');
+      if (sfEl) sfEl.value = saved.status || '';
+      const tfEl = document.getElementById('typeFilter');
+      if (tfEl) tfEl.value = saved.type || 'all';
+    }
+  } catch (e) {}
+}
+
+function updateResultsCounter(movieCount, showCount) {
+  const counter = document.getElementById('resultsCounter');
+  if (counter) {
+    counter.textContent = `Found ${movieCount} movies, ${showCount} shows`;
+  }
+}
+
+// Undo functionality
+async function undoAction() {
+  if (!confirm('Undo last action?')) return;
+  try {
+    const r = await fetch('/api/undo', { method: 'POST' });
+    let j = null;
+    try {
+      j = await r.json();
+    } catch (e) {
+      throw new Error('Undo failed: invalid response');
+    }
+    if (!r.ok || !j || !j.success) {
+      throw new Error((j && j.error) || 'Undo failed');
+    }
+    alert('Action undone successfully');
+    try {
+      await load();
+    } catch (e) {
+      console.error('Reload after undo failed:', e);
+      location.reload();
+    }
+  } catch (e) {
+    alert('Undo error: ' + e.message);
+  }
+}
+
+// Auto-refresh controls
+let autoRefreshTimer = null;
+function updateRefreshIndicator(timeLeft) {
+  const el = document.getElementById('refreshCountdown');
+  if (!el) return;
+  if (timeLeft <= 0) {
+    el.textContent = '';
+  } else {
+    const m = Math.floor(timeLeft / 60000);
+    const s = Math.floor((timeLeft % 60000) / 1000);
+    const pad = n => n.toString().padStart(2, '0');
+    el.textContent = `Refreshing in ${pad(m)}:${pad(s)}`;
+  }
+}
+
+function startAutoRefresh() {
+  if (!autoRefreshEnabled) return;
+
+  // Clear any existing timer
+  if (autoRefreshTimer) {
+    clearTimeout(autoRefreshTimer);
+    autoRefreshTimer = null;
+  }
+
+  const intervalMs = autoRefreshInterval * 60000;
+  const startTime = Date.now();
+
+  function tick() {
+    try {
+      const elapsed = Date.now() - startTime;
+      const remaining = intervalMs - elapsed;
+
+      updateRefreshIndicator(remaining);
+
+      if (remaining <= 0) {
+        const modalOpen = document.querySelector('.modal[style*="display: block"]');
+        const searchActive = document.activeElement && document.activeElement.id === 'search';
+
+        if (!modalOpen && !searchActive) {
+          // Background reload without spinner (prevents desktop "contraction")
+          quickReload(false);
+        }
+
+        // Restart cycle cleanly
+        startAutoRefresh();
+        return;
+      }
+
+      autoRefreshTimer = setTimeout(tick, 1000);
+    } catch (e) {
+      console.error('Auto-refresh tick error:', e);
+      // Keep ticking even if something errors once
+      autoRefreshTimer = setTimeout(tick, 1000);
+    }
+  }
+
+  tick();
+}
+
+function toggleAutoRefresh() {
+  const toggle = document.getElementById('autoRefreshToggle');
+  autoRefreshEnabled = toggle && toggle.checked;
+  localStorage.setItem('autoRefreshEnabled', autoRefreshEnabled ? '1' : '0');
+  if (autoRefreshEnabled) {
+    startAutoRefresh();
+  } else {
+    if (autoRefreshTimer) clearTimeout(autoRefreshTimer);
+    autoRefreshTimer = null;
+    updateRefreshIndicator(0);
+  }
+}
+
+function updateAutoRefreshInterval() {
+  const val = parseInt(document.getElementById('autoRefreshInterval').value, 10);
+  autoRefreshInterval = val;
+  localStorage.setItem('autoRefreshInterval', String(val));
+  if (autoRefreshEnabled) startAutoRefresh();
+}
+
+let autoRefreshEnabled = localStorage.getItem('autoRefreshEnabled') === '1';
+let autoRefreshInterval = parseInt(localStorage.getItem('autoRefreshInterval') || '5', 10);
+
+function startRealtimeUpdates(){
+  if(!('EventSource' in window)) return false;
+  if(eventsSource) return true;
+  try {
+    const es = new EventSource('/api/events');
+    eventsSource = es;
+    es.onopen = () => {
+      realtimeConnected = true;
+      realtimeFailures = 0;
+      sigPollFailures = 0;
+      if(sigPollTimer){
+        clearTimeout(sigPollTimer);
+        sigPollTimer = null;
+      }
+    };
+    es.addEventListener('history_update', async () => {
+      try {
+        await quickReload(false);
+      } catch (_) {}
+    });
+    es.onerror = () => {
+      realtimeConnected = false;
+      realtimeFailures += 1;
+      try { es.close(); } catch(_) {}
+      if(eventsSource === es) eventsSource = null;
+      if(realtimeFailures < 3){
+        setTimeout(() => {
+          if(!eventsSource) startRealtimeUpdates();
+        }, 1200);
+      } else if(!sigPollTimer){
+        scheduleSigPoll(1500);
+      }
+    };
+    return true;
+  } catch(e) {
+    return false;
+  }
+}
+
+async function fetchHistorySig(){
+  return await fetchJsonWithTimeout('/api/realtime_seq', 3500);
+}
+
+function scheduleSigPoll(delayMs){
+  if(sigPollTimer) clearTimeout(sigPollTimer);
+  sigPollTimer = setTimeout(runSigPoll, delayMs);
+}
+
+async function runSigPoll(){
+  if(realtimeConnected) return;
+  if(document.hidden) return scheduleSigPoll(sigPollDelay);
+  if(sigPollBusy) return scheduleSigPoll(sigPollDelay);
+  sigPollBusy = true;
+  try {
+    const j = await fetchHistorySig();
+    if(j && typeof j.seq === 'number'){
+      if(typeof lastRealtimeSeq === 'number' && j.seq > lastRealtimeSeq){
+        await quickReload(false);
+      }
+      lastRealtimeSeq = j.seq;
+      if(j.sig) historySig = j.sig;
+    } else if(j && j.sig){
+      if(historySig && j.sig !== historySig){
+        await quickReload(false);
+      }
+      historySig = j.sig;
+    }
+    sigPollFailures = 0;
+    sigPollDelay = 1500;
+  } catch(e) {
+    sigPollFailures += 1;
+    if(sigPollFailures >= 6){
+      sigPollDelay = 15000;
+    } else if(sigPollFailures >= 3){
+      sigPollDelay = 8000;
+    } else {
+      sigPollDelay = Math.min(sigPollDelay + 1000, 8000);
+    }
+  } finally {
+    sigPollBusy = false;
+    scheduleSigPoll(sigPollDelay);
+  }
+}
+
+function startSigPolling(){
+  if(startRealtimeUpdates()) return;
+  if(sigPollTimer) return;
+  sigPollDelay = 1500;
+  sigPollFailures = 0;
+  scheduleSigPoll(500);
+}
+
+// Theme and layout helpers
+// Removed duplicate applyTheme and changeTheme definitions. The theme
+// handling is implemented earlier in the script using availableThemes,
+// applyTheme() and toggleTheme(). To programmatically set a theme call
+// applyTheme(theme).
+function applyLayout(layout) {
+  const root = document.documentElement;
+
+  const mode = (layout === 'compact' || layout === 'spacious') ? layout : 'comfortable';
+
+  root.classList.remove('layout-compact', 'layout-spacious');
+  if (mode === 'compact') root.classList.add('layout-compact');
+  if (mode === 'spacious') root.classList.add('layout-spacious');
+
+  localStorage.setItem('layout', mode);
+
+  // Force visual update (some CSS/layout depends on render)
+  try { renderHistory(); } catch(e) {}
+}
+
+function changeLayout(layout) {
+  localStorage.setItem('layout', layout || 'comfortable');
+  applyLayout(layout);
+}
+
+// Watch time analytics
+async function renderWatchTime() {
+  try {
+    const res = await fetch('/api/watch_time');
+    const j = await res.json();
+    if (!j || !j.success) return;
+    document.getElementById('wt-total').textContent = formatDurationHours(j.total);
+    document.getElementById('wt-movies').textContent = formatDurationHours(j.movies);
+    document.getElementById('wt-shows').textContent = formatDurationHours(j.shows);
+    document.getElementById('wt-daily').textContent = formatDurationHours(j.avg_per_day);
+    document.getElementById('wt-binge').textContent = (j.binges || []).length;
+    const labels = j.monthly.map(x => x.month);
+    const hours = j.monthly.map(x => x.hours);
+    if (watchTimeChart) { try { watchTimeChart.destroy(); } catch (e) {} }
+    const ctx = document.getElementById('watchTimeChart').getContext('2d');
+    watchTimeChart = new Chart(ctx, {
+      type: 'bar',
+      data: { labels: labels, datasets: [{ label: 'Hours', data: hours, backgroundColor: '#8b9cff' }] },
+      options: {
+        responsive: true,
+        scales: {
+          x: { ticks: { color: '#fff' } },
+          y: { ticks: { color: '#fff' } }
+        },
+        plugins: { legend: { display: false } }
+      }
+    });
+  } catch (e) {
+    console.error('Watch time load error', e);
+  }
+}
+
+/* === End of advanced feature scripts === */
+
 load();
 </script></body></html>"""
 
@@ -4970,7 +7500,11 @@ def webhook():
         payload = request.get_json(force=True, silent=True) or {}
         notification_type = (payload.get("NotificationType") or payload.get("Event") or "").lower()
         
-        if "playbackstop" not in notification_type and "stop" not in notification_type:
+        if notification_type and (
+            "playbackstop" not in notification_type and
+            "stop" not in notification_type and
+            "ended" not in notification_type
+        ):
             return jsonify({"success": True, "ignored": True})
 
         item_type = payload.get("ItemType") or payload.get("Type") or (payload.get("Item", {}) or {}).get("Type") or "Unknown"
@@ -4981,6 +7515,19 @@ def webhook():
         episode = payload.get("EpisodeNumber") or (payload.get("Item", {}) or {}).get("IndexNumber")
         user = payload.get("NotificationUsername") or (payload.get("User", {}) or {}).get("Name") or "Unknown"
         genres = payload.get("Genres") or (payload.get("Item", {}) or {}).get("Genres") or []
+        genres_norm = _normalize_genres(genres)
+
+        dedupe_key = (
+            str(notification_type or "").strip().lower(),
+            str(item_type or "").strip().lower(),
+            str(name or "").strip().lower(),
+            str(series_name or "").strip().lower(),
+            _coerce_int(season, None),
+            _coerce_int(episode, None),
+            str(user or "").strip().lower(),
+        )
+        if _is_duplicate_webhook_event(dedupe_key):
+            return jsonify({"success": True, "ignored": True, "duplicate": True})
 
         record = {
             "timestamp": datetime.now().isoformat(),
@@ -4991,11 +7538,26 @@ def webhook():
             "season": season,
             "episode": episode,
             "user": user,
-            "genres": genres if isinstance(genres, list) else [],
+            "genres": genres_norm,
             "source": "webhook",
         }
 
         append_record(record)
+        # Keep the previous organized payload so we can reuse TMDB totals while
+        # recomputing; the signature change will still force a refresh.
+        cache["time"] = None
+        cache["sig"] = None
+        # Rebuild missing posters/episode totals in the background (does not block webhook).
+        try:
+            if str(item_type or "").strip().lower() == "movie":
+                _queue_tmdb_poster_fetch(name, year, "movie")
+            elif str(item_type or "").strip().lower() == "episode":
+                _queue_tmdb_poster_fetch(series_name or name, year, "tv")
+                # Jellyfin webhooks frequently provide episode-year values here; use title-only matching.
+                _queue_tmdb_series_fetch(series_name or name, expected_year=None)
+        except Exception:
+            pass
+        prewarm_organized_cache_async()
         return jsonify({"success": True})
 
     except Exception as e:
@@ -5006,9 +7568,65 @@ def webhook():
 def api_history():
     return jsonify(organize_data())
 
+@app.route("/api/history_sig")
+def api_history_sig():
+    try:
+        global history_sig_fast
+        sig = history_sig_fast or cache.get("sig")
+        if not sig:
+            sig = _data_signature()
+            history_sig_fast = sig
+        return jsonify({"sig": sig})
+    except Exception as e:
+        return jsonify({"sig": None, "error": str(e)}), 500
+
+@app.route("/api/realtime_seq")
+def api_realtime_seq():
+    try:
+        return jsonify({
+            "seq": realtime_seq,
+            "sig": history_sig_fast or cache.get("sig")
+        })
+    except Exception as e:
+        return jsonify({"seq": None, "sig": None, "error": str(e)}), 500
+
+@app.route("/api/events")
+def api_events():
+    try:
+        last_id_raw = request.headers.get("Last-Event-ID") or request.args.get("last")
+        last_id = _coerce_int(last_id_raw, None)
+        if last_id is None:
+            last_id = realtime_seq
+
+        def _stream(start_seq):
+            current = start_seq
+            # Open the stream immediately
+            yield "event: ready\ndata: {}\n\n"
+            while True:
+                changed = False
+                with realtime_cv:
+                    if realtime_seq <= current:
+                        realtime_cv.wait(timeout=20.0)
+                    if realtime_seq > current:
+                        current = realtime_seq
+                        changed = True
+                if changed:
+                    payload = json.dumps({"seq": current})
+                    yield f"id: {current}\nevent: history_update\ndata: {payload}\n\n"
+                else:
+                    yield "event: ping\ndata: {}\n\n"
+
+        resp = Response(_stream(last_id), mimetype="text/event-stream")
+        resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        resp.headers["X-Accel-Buffering"] = "no"
+        return resp
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
 @app.route('/api/genre_recommendations', methods=['GET'])
 def get_genre_recommendations():
     try:
+        global genre_recs_cache
         # Get offset parameter (for pagination)
         offset = int(request.args.get('offset', 0))
         
@@ -5029,70 +7647,110 @@ def get_genre_recommendations():
         
         # Get top genre (will match pie chart now!)
         top_genre = max(genre_counts, key=genre_counts.get)
+        top_genre_norm = str(top_genre or "").strip().lower()
+        if not top_genre_norm:
+            return jsonify({'success': True, 'top_genre': None, 'movies': [], 'shows': [], 'has_more': False})
 
-        # Get recommendations from Radarr (movies)
-        all_recommended_movies = []
-        radarr_url = os.getenv("RADARR_URL")
-        radarr_key = os.getenv("RADARR_API_KEY")
-        
-        if radarr_url and radarr_key:
-            try:
-                radarr_resp = requests.get(
-                    f'{radarr_url}/api/v3/movie',
-                    headers={'X-Api-Key': radarr_key},
-                    timeout=10
-                )
-                if radarr_resp.ok:
-                    all_movies = radarr_resp.json()
-                    watched_movie_titles = {m['name'].lower() for m in org_data.get('movies', [])}
-                    
-                    for movie in all_movies:
-                        movie_genres = movie.get('genres', [])
-                        if movie_genres and top_genre in movie_genres:
-                            title = movie.get('title', '')
-                            if title.lower() not in watched_movie_titles:
-                                all_recommended_movies.append({
-                                    'title': title,
-                                    'year': movie.get('year'),
-                                    'overview': (movie.get('overview', '') or 'No description')[:150] + '...',
-                                    'genres': movie_genres,
-                                    'tmdbId': movie.get('tmdbId')
-                                })
-            except Exception as e:
-                print(f"Radarr error: {e}")
-                traceback.print_exc()
-        
-        # Get recommendations from Sonarr (shows)
-        all_recommended_shows = []
-        sonarr_url = os.getenv("SONARR_URL")
-        sonarr_key = os.getenv("SONARR_API_KEY")
-        
-        if sonarr_url and sonarr_key:
-            try:
-                sonarr_resp = requests.get(
-                    f'{sonarr_url}/api/v3/series',
-                    headers={'X-Api-Key': sonarr_key},
-                    timeout=10
-                )
-                if sonarr_resp.ok:
-                    all_shows = sonarr_resp.json()
-                    watched_show_titles = {s['series_name'].lower() for s in org_data.get('shows', [])}
-                    
-                    for show in all_shows:
-                        show_genres = show.get('genres', [])
-                        if show_genres and top_genre in show_genres:
-                            title = show.get('title', '')
-                            if title.lower() not in watched_show_titles:
-                                all_recommended_shows.append({
-                                    'title': title,
-                                    'year': show.get('year'),
-                                    'overview': (show.get('overview', '') or 'No description')[:150] + '...',
-                                    'genres': show_genres,
-                                    'tvdbId': show.get('tvdbId')
-                                })
-            except Exception as e:
-                print(f"Sonarr error: {e}")
-                traceback.print_exc()
+        now_ts = time.time()
+        cache_fresh = (
+            genre_recs_cache.get("top_genre") == top_genre and
+            (now_ts - float(genre_recs_cache.get("ts") or 0)) < 1800
+        )
+
+        if cache_fresh:
+            all_recommended_movies = list(genre_recs_cache.get("movies") or [])
+            all_recommended_shows = list(genre_recs_cache.get("shows") or [])
+        else:
+            radarr_url = os.getenv("RADARR_URL")
+            radarr_key = os.getenv("RADARR_API_KEY")
+            sonarr_url = os.getenv("SONARR_URL")
+            sonarr_key = os.getenv("SONARR_API_KEY")
+
+            watched_movie_titles = {str(m.get('name', '')).lower() for m in org_data.get('movies', [])}
+            watched_show_titles = {str(s.get('series_name', '')).lower() for s in org_data.get('shows', [])}
+
+            def _fetch_radarr():
+                out = []
+                if not (radarr_url and radarr_key):
+                    return out
+                try:
+                    radarr_resp = requests.get(
+                        f'{radarr_url}/api/v3/movie',
+                        headers={'X-Api-Key': radarr_key},
+                        timeout=8
+                    )
+                    if not radarr_resp.ok:
+                        return out
+                    for movie in radarr_resp.json() or []:
+                        movie_genres = _normalize_genres(movie.get('genres', []) or [])
+                        if not movie_genres:
+                            continue
+                        movie_genres_norm = {str(g or "").strip().lower() for g in movie_genres}
+                        if top_genre_norm not in movie_genres_norm:
+                            continue
+                        title = str(movie.get('title', '') or '')
+                        if title.lower() in watched_movie_titles:
+                            continue
+                        out.append({
+                            'title': title,
+                            'year': movie.get('year'),
+                            'overview': (movie.get('overview', '') or 'No description')[:150] + '...',
+                            'genres': movie_genres,
+                            'tmdbId': movie.get('tmdbId')
+                        })
+                except Exception as e:
+                    print(f"Radarr error: {e}")
+                return out
+
+            def _fetch_sonarr():
+                out = []
+                if not (sonarr_url and sonarr_key):
+                    return out
+                try:
+                    sonarr_resp = requests.get(
+                        f'{sonarr_url}/api/v3/series',
+                        headers={'X-Api-Key': sonarr_key},
+                        timeout=8
+                    )
+                    if not sonarr_resp.ok:
+                        return out
+                    for show in sonarr_resp.json() or []:
+                        show_genres = _normalize_genres(show.get('genres', []) or [])
+                        if not show_genres:
+                            continue
+                        show_genres_norm = {str(g or "").strip().lower() for g in show_genres}
+                        if top_genre_norm not in show_genres_norm:
+                            continue
+                        title = str(show.get('title', '') or '')
+                        if title.lower() in watched_show_titles:
+                            continue
+                        out.append({
+                            'title': title,
+                            'year': show.get('year'),
+                            'overview': (show.get('overview', '') or 'No description')[:150] + '...',
+                            'genres': show_genres,
+                            'tvdbId': show.get('tvdbId')
+                        })
+                except Exception as e:
+                    print(f"Sonarr error: {e}")
+                return out
+
+            with ThreadPoolExecutor(max_workers=2) as ex:
+                fm = ex.submit(_fetch_radarr)
+                fs = ex.submit(_fetch_sonarr)
+                all_recommended_movies = fm.result()
+                all_recommended_shows = fs.result()
+
+            all_recommended_movies.sort(key=lambda x: (x.get('title') or '').lower())
+            all_recommended_shows.sort(key=lambda x: (x.get('title') or '').lower())
+
+            genre_recs_cache = {
+                "sig": org_data.get("sig"),
+                "top_genre": top_genre,
+                "ts": now_ts,
+                "movies": all_recommended_movies,
+                "shows": all_recommended_shows,
+            }
         
         # Paginate results (5 movies + 5 shows per page)
         start_idx = offset * 5
@@ -5125,56 +7783,19 @@ def get_genre_recommendations():
 @app.route('/api/genre_insights', methods=['GET'])
 def get_genre_insights():
     try:
+        global genre_insights_cache
+        sig = None
+        try:
+            sig = _data_signature()
+            if genre_insights_cache.get("sig") == sig and genre_insights_cache.get("data"):
+                return jsonify(genre_insights_cache["data"])
+        except Exception:
+            sig = None
+
         org_data = organize_data()
-        records = get_all_records()
-        
-        # Time-based genre trends (this month vs last month)
-        now = datetime.now()
-        month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        last_month_start = (month_start - timedelta(days=1)).replace(day=1)
-        
-        this_month_genres = Counter()
-        last_month_genres = Counter()
-        
-        for r in records:
-            try:
-                dt = datetime.fromisoformat(r["timestamp"].replace("Z", "").split("+")[0])
-                genres = r.get("genres", [])
-                
-                if dt >= month_start:
-                    for g in genres:
-                        this_month_genres[g] += 1
-                elif dt >= last_month_start and dt < month_start:
-                    for g in genres:
-                        last_month_genres[g] += 1
-            except:
-                pass
-        
-        # Calculate trends
+        # Keep /api/genre_insights fast: UI doesn't render trends, and scanning
+        # large history files here causes slow loads/timeouts.
         trends = []
-        all_genres = set(this_month_genres.keys()) | set(last_month_genres.keys())
-        
-        for genre in all_genres:
-            this_count = this_month_genres.get(genre, 0)
-            last_count = last_month_genres.get(genre, 0)
-            
-            if last_count > 0:
-                change_pct = round(((this_count - last_count) / last_count) * 100)
-            elif this_count > 0:
-                change_pct = 100  # New genre this month
-            else:
-                change_pct = 0
-            
-            if abs(change_pct) >= 20 and this_count >= 3:  # Significant changes only
-                trends.append({
-                    "genre": genre,
-                    "this_month": this_count,
-                    "last_month": last_count,
-                    "change": change_pct,
-                    "direction": "up" if change_pct > 0 else "down"
-                })
-        
-        trends.sort(key=lambda x: abs(x["change"]), reverse=True)
         
         # Genre combinations you like
         genre_combos = Counter()
@@ -5223,12 +7844,20 @@ def get_genre_insights():
             if count > 0:
                 moods[mood] = {"count": count, "genres": mood_genres}
         
-        return jsonify({
+        insights_payload = {
             "success": True,
-            "trends": trends[:5],  # Top 5 trends
+            "trends": trends,
             "combos": top_combos,
             "moods": moods
-        })
+        }
+
+        try:
+            genre_insights_cache["sig"] = sig
+            genre_insights_cache["data"] = insights_payload
+        except Exception:
+            pass
+
+        return jsonify(insights_payload)
     
     except Exception as e:
         print(f"Genre insights error: {e}")
@@ -5511,12 +8140,31 @@ def api_mark_complete():
         
         manual_complete[series_name] = True
         save_cache("complete")
-        
+
+        # Also mark all seasons complete for this show
+        season_keys = []
+        try:
+            data_all = organize_data()
+            for show in data_all.get("shows", []):
+                if show.get("series_name") == series_name:
+                    for season in show.get("seasons", []):
+                        snum = season.get("season_number")
+                        if snum is None:
+                            continue
+                        season_key = f"{series_name}_{snum}"
+                        season_complete[season_key] = True
+                        season_keys.append(season_key)
+                    break
+        except Exception:
+            season_keys = []
+        if season_keys:
+            save_cache("season_complete")
+
+        # Record action for undo
+        record_action("mark_complete", {"series_name": series_name, "season_keys": season_keys})
         cache["data"] = None
         cache["time"] = None
-        
         print(f"✓ Marked as complete: {series_name}")
-        
         return jsonify({"success": True})
     
     except Exception as e:
@@ -5539,12 +8187,11 @@ def api_mark_season_complete():
         season_key = f"{series_name}_{season}"
         season_complete[season_key] = True
         save_cache("season_complete")
-        
+        # Record action for undo
+        record_action("mark_season_complete", {"series_name": series_name, "season": season, "season_key": season_key})
         cache["data"] = None
         cache["time"] = None
-        
         print(f"✓ Marked season as complete: {series_name} S{season}")
-        
         return jsonify({"success": True})
     
     except Exception as e:
@@ -5556,16 +8203,26 @@ def api_mark_season_complete():
 @app.route("/api/clear_tmdb_cache", methods=["POST"])
 def api_clear_tmdb_cache():
     try:
-        global series_cache, poster_cache
+        global series_cache, poster_cache, tmdb_retry, genre_recs_cache
         series_cache = {}
         poster_cache = {}
+        tmdb_retry = set()
+        genre_recs_cache = {"sig": None, "top_genre": None, "ts": 0, "movies": [], "shows": []}
         save_cache("series")
         save_cache("poster")
+
+        # Also reset persisted show totals so they can be rebuilt from fresh TMDB series info.
+        try:
+            save_json_file(SHOW_TOTALS_FILE, {})
+        except Exception:
+            pass
         
         cache["data"] = None
         cache["time"] = None
         
         print("✓ TMDB cache cleared")
+        # Kick off background rebuild so posters/totals repopulate without blocking /api/history.
+        prewarm_tmdb_cache_async(force=True)
         
         return jsonify({"success": True})
     
@@ -5633,6 +8290,12 @@ def api_clear_insights():
         # Reset data cache so that subsequent requests recompute insights
         cache["data"] = None
         cache["time"] = None
+        try:
+            global genre_insights_cache, genre_recs_cache
+            genre_insights_cache = {"sig": None, "data": None}
+            genre_recs_cache = {"sig": None, "top_genre": None, "ts": 0, "movies": [], "shows": []}
+        except Exception:
+            pass
         print("✓ Insights cleared")
         return jsonify({"success": True})
     except Exception as e:
@@ -5652,9 +8315,8 @@ def api_bulk_delete_episodes():
             return jsonify({"success": False, "error": "No episodes provided"}), 400
         
         records = get_all_records()
+        to_delete = []
         filtered = []
-        deleted = 0
-        
         for r in records:
             should_delete = False
             if r.get("type") == "Episode":
@@ -5663,15 +8325,17 @@ def api_bulk_delete_episodes():
                         r.get("season") == ep_data["season"] and 
                         r.get("episode") == ep_data["episode"]):
                         should_delete = True
-                        deleted += 1
+                        to_delete.append(r)
                         break
-            
             if not should_delete:
                 filtered.append(r)
-        
+        deleted = len(to_delete)
+        if deleted > 0:
+            record_action("bulk_delete", {"records": to_delete})
         save_all_records(filtered)
+        cache["data"] = None
+        cache["time"] = None
         print(f"✓ Bulk deleted {deleted} episodes")
-        
         return jsonify({"success": True, "deleted": deleted})
     
     except Exception as e:
@@ -5686,20 +8350,23 @@ def api_delete_movie():
         data = request.get_json()
         movie_name = data.get("name")
         movie_year = data.get("year")
-        
+        # Gather all records to be deleted so we can restore them on undo
         records = get_all_records()
+        to_delete = []
         filtered = []
-        deleted = 0
-        
         for r in records:
             if r.get("type") == "Movie" and r.get("name") == movie_name and r.get("year") == movie_year:
-                deleted += 1
+                to_delete.append(r)
             else:
                 filtered.append(r)
-        
+        deleted = len(to_delete)
+        # Record the action for undo
+        if deleted > 0:
+            record_action("delete_movie", {"name": movie_name, "year": movie_year, "records": to_delete})
         save_all_records(filtered)
+        cache["data"] = None
+        cache["time"] = None
         print(f"✓ Deleted movie: {movie_name} ({movie_year}) - {deleted} records")
-        
         return jsonify({"success": True, "deleted": deleted})
     
     except Exception as e:
@@ -5711,24 +8378,26 @@ def api_delete_show():
     try:
         data = request.get_json()
         series_name = data.get("series_name")
-        
+        # If the series was manually marked complete remove the flag, record it for undo
         if series_name in manual_complete:
             del manual_complete[series_name]
             save_cache("complete")
-        
+        # Gather all episode records to be deleted
         records = get_all_records()
+        to_delete = []
         filtered = []
-        deleted = 0
-        
         for r in records:
             if r.get("type") == "Episode" and r.get("series_name") == series_name:
-                deleted += 1
+                to_delete.append(r)
             else:
                 filtered.append(r)
-        
+        deleted = len(to_delete)
+        if deleted > 0:
+            record_action("delete_show", {"series_name": series_name, "records": to_delete})
         save_all_records(filtered)
+        cache["data"] = None
+        cache["time"] = None
         print(f"✓ Deleted show: {series_name} - {deleted} records")
-        
         return jsonify({"success": True, "deleted": deleted})
     
     except Exception as e:
@@ -5743,18 +8412,20 @@ def api_delete_season():
         season = data.get("season")
         
         records = get_all_records()
+        to_delete = []
         filtered = []
-        deleted = 0
-        
         for r in records:
             if r.get("type") == "Episode" and r.get("series_name") == series_name and r.get("season") == season:
-                deleted += 1
+                to_delete.append(r)
             else:
                 filtered.append(r)
-        
+        deleted = len(to_delete)
+        if deleted > 0:
+            record_action("delete_season", {"series_name": series_name, "season": season, "records": to_delete})
         save_all_records(filtered)
+        cache["data"] = None
+        cache["time"] = None
         print(f"✓ Deleted season: {series_name} S{season} - {deleted} records")
-        
         return jsonify({"success": True, "deleted": deleted})
     
     except Exception as e:
@@ -5769,25 +8440,269 @@ def api_delete_episode():
         episode = data.get("episode")
         
         records = get_all_records()
+        to_delete = []
         filtered = []
-        deleted = 0
-        
         for r in records:
             if (r.get("type") == "Episode" and 
                 r.get("series_name") == series_name and 
                 r.get("season") == season and 
                 r.get("episode") == episode):
-                deleted += 1
+                to_delete.append(r)
             else:
                 filtered.append(r)
-        
+        deleted = len(to_delete)
+        if deleted > 0:
+            record_action("delete_episode", {"series_name": series_name, "season": season, "episode": episode, "records": to_delete})
         save_all_records(filtered)
+        cache["data"] = None
+        cache["time"] = None
         print(f"✓ Deleted episode: {series_name} S{season}E{episode} - {deleted} records")
-        
         return jsonify({"success": True, "deleted": deleted})
     
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
+
+
+# ---------------------------------------------------------------------------
+# NEW API ENDPOINTS FOR ADVANCED FEATURES
+
+@app.route("/api/ratings", methods=["GET"])
+def api_get_ratings():
+    """
+    Return the stored ratings for all movies and shows.  The returned JSON
+    is keyed by item identifier (e.g. "movie|Inception|2010" or "show|Breaking Bad").
+    """
+    try:
+        return jsonify(load_ratings())
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/rate", methods=["POST"])
+def api_rate():
+    """
+    Submit or update a rating for a movie or show.  Expects JSON with
+    fields 'id' (the unique item identifier), 'rating' (1-5), and
+    optional 'note'.  On success the data is saved to RATINGS_FILE and
+    the cache is cleared so the rating is included on next load.
+    """
+    try:
+        data = request.get_json() or {}
+        item_id = data.get("id") or data.get("key")
+        rating = data.get("rating")
+        note = data.get("note", "")
+        if not item_id or rating is None:
+            return jsonify({"success": False, "error": "Missing id or rating"}), 400
+        # Ensure rating is within 1-5
+        try:
+            rating_int = int(rating)
+        except Exception:
+            return jsonify({"success": False, "error": "Rating must be a number"}), 400
+        if rating_int < 1 or rating_int > 5:
+            return jsonify({"success": False, "error": "Rating must be between 1 and 5"}), 400
+        ratings_cache = load_ratings()
+        ratings_cache[item_id] = {"rating": rating_int, "note": note}
+        save_ratings(ratings_cache)
+        # clear cache so UI picks up new rating
+        cache["data"] = None
+        cache["time"] = None
+        return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/watch_time", methods=["GET"])
+def api_watch_time():
+    """
+    Compute overall watch time analytics.  The total watch time and breakdown
+    by movies and TV shows are calculated in hours.  A monthly trend
+    indicates total hours watched per month.  Average watch time per day
+    is computed, as well as a count of binge sessions (defined as days
+    where at least 3 hours of content were watched).
+    """
+    try:
+        records = get_all_records()
+        total_minutes = 0
+        movie_minutes = 0
+        show_minutes = 0
+        monthly_minutes = defaultdict(int)
+        daily_minutes = defaultdict(int)
+        for rec in records:
+            ts = rec.get("timestamp")
+            if not ts:
+                continue
+            try:
+                dt = datetime.fromisoformat(ts.replace("Z", "").split("+")[0])
+            except Exception:
+                continue
+            month_key = dt.strftime("%Y-%m")
+            day_key = dt.date()
+            if rec.get("type") == "Movie":
+                # Use runtime from record if available; otherwise assume 110 minutes
+                runtime = rec.get("runtime")
+                minutes = runtime if isinstance(runtime, (int, float)) else 110
+                movie_minutes += minutes
+            elif rec.get("type") == "Episode":
+                # Use runtime from record if available; otherwise assume 45 minutes
+                runtime = rec.get("runtime")
+                minutes = runtime if isinstance(runtime, (int, float)) else 45
+                show_minutes += minutes
+            else:
+                continue
+            total_minutes += minutes
+            monthly_minutes[month_key] += minutes
+            daily_minutes[day_key] += minutes
+        # Convert aggregated minutes into hours with rounding
+        total_hours = round(total_minutes / 60.0, 2)
+        movies_hours = round(movie_minutes / 60.0, 2)
+        shows_hours = round(show_minutes / 60.0, 2)
+        # monthly list of dicts for chart consumption
+        monthly_list = []
+        for m, mins in sorted(monthly_minutes.items()):
+            monthly_list.append({"month": m, "hours": round(mins / 60.0, 2)})
+        avg_hours_per_day = round((total_minutes / 60.0) / len(daily_minutes), 2) if daily_minutes else 0
+        # Determine binge sessions: list of dates where >= 3 hours (180 minutes) watched
+        binge_dates = [day.isoformat() for day, mins in daily_minutes.items() if mins >= 180]
+        return jsonify({
+            "success": True,
+            "total": total_hours,
+            "movies": movies_hours,
+            "shows": shows_hours,
+            "monthly": monthly_list,
+            "avg_per_day": avg_hours_per_day,
+            # use 'binges' key to align with frontend expectation (plural)
+            "binges": binge_dates
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/undo", methods=["POST"])
+def api_undo():
+    """
+    Undo the last user action (e.g., delete or mark complete).  The action
+    history stores the last 20 actions and their payloads.  Depending on
+    the action type the undo operation will restore deleted records or
+    reverse the completed status.  If no actions are available to undo an
+    error is returned.
+    """
+    try:
+        history = load_action_history()
+        if not history:
+            return jsonify({"success": False, "error": "No actions to undo"}), 400
+        last = history.pop()
+        save_action_history(history)
+        action_type = last.get("type")
+        payload = last.get("payload", {})
+        if action_type in ("delete_movie", "delete_show", "delete_season", "delete_episode", "bulk_delete"):
+            # Restore deleted records
+            recs = payload.get("records", [])
+            existing = get_all_records()
+            for rec in recs:
+                existing.append(rec)
+            save_all_records(existing)
+            # Clearing cache ensures UI refreshes
+            cache["data"] = None
+            cache["time"] = None
+        elif action_type == "mark_complete":
+            # Remove manual completion flag for a series
+            series_name = payload.get("series_name")
+            if series_name and series_name in manual_complete:
+                del manual_complete[series_name]
+                save_cache("complete")
+            season_keys = payload.get("season_keys") or []
+            if season_keys:
+                for season_key in season_keys:
+                    if season_key in season_complete:
+                        del season_complete[season_key]
+                save_cache("season_complete")
+            cache["data"] = None
+            cache["time"] = None
+        elif action_type == "mark_season_complete":
+            # Remove manual completion flag for a season
+            season_key = payload.get("season_key")
+            if season_key and season_key in season_complete:
+                del season_complete[season_key]
+                save_cache("season_complete")
+            cache["data"] = None
+            cache["time"] = None
+        return jsonify({"success": True, "undone": action_type})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/manifest.json')
+def manifest():
+    """
+    Serve a minimal web app manifest for PWA installation.  The icons
+    referenced here use placeholder images served from placeholder.com.
+    """
+    try:
+        manifest_data = {
+            "name": "Jellyfin Watch Tracker",
+            "short_name": "Watch Tracker",
+            "start_url": "/",
+            "display": "standalone",
+            "background_color": "#0a0e27",
+            "theme_color": "#8b9cff",
+            "icons": [
+                {"src": "https://via.placeholder.com/192", "sizes": "192x192", "type": "image/png"},
+                {"src": "https://via.placeholder.com/512", "sizes": "512x512", "type": "image/png"}
+            ]
+        }
+        return jsonify(manifest_data)
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/sw.js')
+def service_worker():
+    """
+    Serve a simple service worker script enabling offline caching of the
+    application shell.  The worker caches the homepage and manifest on
+    install and serves cached responses on subsequent requests when
+    available.  Update CACHE_NAME to invalidate the cache when code
+    changes.
+    """
+    sw_script = """
+const CACHE_NAME = 'watch-tracker-v21';
+const urlsToCache = [
+  '/manifest.json'
+];
+self.addEventListener('install', (event) => {
+  event.waitUntil(
+    caches.open(CACHE_NAME).then((cache) => {
+      return cache.addAll(urlsToCache);
+    })
+  );
+  self.skipWaiting();
+});
+self.addEventListener('activate', (event) => {
+  event.waitUntil(
+    caches.keys().then((names) => Promise.all(
+      names.map((n) => (n !== CACHE_NAME ? caches.delete(n) : Promise.resolve()))
+    ))
+  );
+  self.clients.claim();
+});
+self.addEventListener('fetch', (event) => {
+  if (event.request.mode === 'navigate') {
+    // Always prefer the network for HTML so UI/JS updates aren't stuck behind cache.
+    event.respondWith(fetch(event.request, { cache: 'no-store' }));
+    return;
+  }
+  const url = new URL(event.request.url);
+  if (urlsToCache.includes(url.pathname)) {
+    event.respondWith(
+      caches.match(event.request).then((response) => response || fetch(event.request))
+    );
+    return;
+  }
+  // Do not cache other requests (including /api/*) to avoid stale data.
+  event.respondWith(fetch(event.request));
+});
+"""
+    return Response(sw_script, mimetype='application/javascript')
 
 
 @app.route("/api/jellyfin_import", methods=["POST"])
@@ -5850,51 +8765,99 @@ def serve_poster(filename):
 @app.route("/api/export/<fmt>")
 def api_export(fmt):
     if fmt == "json":
-        with open(DATA_FILE) as f:
-            content = f.read()
-        return send_file(io.BytesIO(content.encode()), mimetype="application/json", as_attachment=True, download_name=f"watch_history_{datetime.now().strftime('%Y%m%d')}.json")
-    
+        # Build a JSON array of records with optional rating and note fields
+        try:
+            records = get_all_records()
+            ratings_cache = load_ratings()
+            enriched = []
+            for r in records:
+                entry = r.copy()
+                # Determine rating key based on type
+                if r.get("type") == "Movie":
+                    key = f"movie|{r.get('name')}|{r.get('year')}"
+                elif r.get("type") == "Episode":
+                    key = f"show|{r.get('series_name')}"
+                else:
+                    key = None
+                if key and key in ratings_cache:
+                    entry["rating"] = ratings_cache[key].get("rating")
+                    entry["note"] = ratings_cache[key].get("note")
+                enriched.append(entry)
+            content = json.dumps(enriched, ensure_ascii=False)
+            return send_file(io.BytesIO(content.encode()), mimetype="application/json", as_attachment=True, download_name=f"watch_history_{datetime.now().strftime('%Y%m%d')}.json")
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
     elif fmt == "csv":
-        records = get_all_records()
-        output = io.StringIO()
-        writer = csv.DictWriter(output, fieldnames=["timestamp", "type", "name", "year", "series_name", "season", "episode", "user", "genres", "source"])
-        writer.writeheader()
-        for r in records:
-            r_copy = r.copy()
-            r_copy["genres"] = ", ".join(r_copy.get("genres", []))
-            writer.writerow(r_copy)
-        
-        return send_file(
-            io.BytesIO(output.getvalue().encode()),
-            mimetype="text/csv",
-            as_attachment=True,
-            download_name=f"watch_history_{datetime.now().strftime('%Y%m%d')}.csv"
-        )
-    
+        try:
+            records = get_all_records()
+            ratings_cache = load_ratings()
+            # Define CSV columns including rating and note
+            fieldnames = ["timestamp", "type", "name", "year", "series_name", "season", "episode", "user", "genres", "source", "rating", "note"]
+            output = io.StringIO()
+            writer = csv.DictWriter(output, fieldnames=fieldnames)
+            writer.writeheader()
+            for r in records:
+                row = {k: r.get(k) for k in ["timestamp", "type", "name", "year", "series_name", "season", "episode", "user", "source"]}
+                # Convert genres list to string
+                row["genres"] = ", ".join(r.get("genres", []))
+                # Determine rating key
+                if r.get("type") == "Movie":
+                    key = f"movie|{r.get('name')}|{r.get('year')}"
+                elif r.get("type") == "Episode":
+                    key = f"show|{r.get('series_name')}"
+                else:
+                    key = None
+                if key and key in ratings_cache:
+                    row["rating"] = ratings_cache[key].get("rating")
+                    row["note"] = ratings_cache[key].get("note")
+                else:
+                    row["rating"] = ''
+                    row["note"] = ''
+                writer.writerow(row)
+            return send_file(
+                io.BytesIO(output.getvalue().encode()),
+                mimetype="text/csv",
+                as_attachment=True,
+                download_name=f"watch_history_{datetime.now().strftime('%Y%m%d')}.csv"
+            )
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
     return jsonify({"error": "invalid format"}), 400
 
 
 if __name__ == "__main__":
     os.makedirs("/data", exist_ok=True)
     os.makedirs(POSTER_DIR, exist_ok=True)
+    try:
+        if not os.path.exists(TMDB_TOUCH_FILE):
+            with open(TMDB_TOUCH_FILE, "w") as f:
+                f.write(str(time.time_ns()))
+    except Exception:
+        pass
     if not os.path.exists(DATA_FILE):
         open(DATA_FILE, "a").close()
     load_caches()
+    refresh_history_sig_fast()
+    # Rebuild posters/series totals in the background on startup.
+    prewarm_tmdb_cache_async()
     
     print("=" * 60)
-    print("JELLYFIN WATCH TRACKER - VERSION 34")
-    print("BULK ACTIONS & SEASON COMPLETE EDITION")
+    print("JELLYFIN WATCH TRACKER - VERSION 35")
+    print("ADVANCED SEARCH, RATINGS & PWA EDITION")
     print("=" * 60)
     print(f"UI:      http://0.0.0.0:5000")
     print(f"Webhook: http://0.0.0.0:5000/webhook")
     print(f"Records: {len(get_all_records())}")
     print("=" * 60)
     print("\n✨ NEW FEATURES:")
-    print("  • ✅ Mark Season as 100% Complete")
-    print("  • ☑️  Multi-Select Episodes with Checkboxes")
-    print("  • 🗑️ Bulk Delete Selected Episodes")
-    print("  • 📊 Visual Selection Counter")
-    print("  • ⚡ Select All / Clear Selection")
+    print("  • 🔍 Advanced Search & Filters (genre, year range, status, type)")
+    print("  • ⭐ Rating System with notes and export support")
+    print("  • 📱 Better Mobile Experience with responsive design")
+    print("  • ⏱️ Watch Time Analytics with monthly trends and binge detection")
+    print("  • ↩️ Undo Button to revert recent actions")
+    print("  • 🔄 Auto-Refresh with configurable intervals and smart pausing")
+    print("  • 🎨 Themes & Customization including dark/light/amoled/solarized/nord")
+    print("  • 📲 Progressive Web App support with offline caching")
     print("=" * 60 + "\n")
     
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
