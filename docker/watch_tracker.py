@@ -1,5 +1,5 @@
 from flask import Flask, request, jsonify, send_file, Response
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import json
 import os
 from collections import Counter, defaultdict
@@ -43,6 +43,35 @@ SONARR_URL = os.getenv("SONARR_URL", "").rstrip("/")
 SONARR_API_KEY = os.getenv("SONARR_API_KEY", "")
 RADARR_URL = os.getenv("RADARR_URL", "").rstrip("/")
 RADARR_API_KEY = os.getenv("RADARR_API_KEY", "")
+# Used for "Open in Jellyfin" links in the UI. If Jellyfin is behind a reverse proxy,
+# set this to the public base URL (e.g. https://media.example.com/jellyfin).
+JELLYFIN_PUBLIC_URL = os.getenv("JELLYFIN_PUBLIC_URL", "").rstrip("/")
+
+# Jellyfin polling fallback:
+# Some clients/autoplay flows don't reliably emit a "stop/ended" webhook.
+# This lightweight poller periodically checks Jellyfin for newly played items
+# and appends them to the local history.
+def _env_bool(name, default=False):
+    v = os.getenv(name)
+    if v is None:
+        return default
+    s = str(v).strip().lower()
+    return s in ("1", "true", "yes", "y", "on")
+
+def _env_int(name, default):
+    try:
+        v = os.getenv(name, None)
+        if v is None:
+            return default
+        return int(str(v).strip())
+    except Exception:
+        return default
+
+JELLYFIN_POLL_ENABLED = _env_bool("JELLYFIN_POLL_ENABLED", default=True)
+JELLYFIN_POLL_INTERVAL_S = _env_int("JELLYFIN_POLL_INTERVAL_S", 60)
+JELLYFIN_POLL_LIMIT = _env_int("JELLYFIN_POLL_LIMIT", 80)
+JELLYFIN_POLL_LOOKBACK_S = _env_int("JELLYFIN_POLL_LOOKBACK_S", 7 * 24 * 3600)
+JELLYFIN_POLL_STATE_FILE = "/data/jellyfin_poll_state.json"
 
 cache = {"data": None, "time": None}
 poster_cache = {}
@@ -114,6 +143,17 @@ def _update_show_totals_from_tmdb(series_name, expected_year, series_info):
             if not n:
                 continue
             aliases.extend([n, n.lower(), _norm_title(n)])
+        # Also store under TMDB-canonical name to survive manual-entry formatting differences.
+        try:
+            tmdbn = str((series_info or {}).get("tmdb_name") or "").strip()
+        except Exception:
+            tmdbn = ""
+        if tmdbn:
+            tmdb_base = _strip_year_suffix(tmdbn)
+            for n in (tmdbn, tmdb_base):
+                if not n:
+                    continue
+                aliases.extend([n, n.lower(), _norm_title(n)])
 
         payload = load_json_file(SHOW_TOTALS_FILE)
         if not isinstance(payload, dict):
@@ -697,6 +737,107 @@ def get_tmdb_poster(title, year=None, media_type="movie", allow_network=True):
 
     return poster_url
 
+
+def get_tmdb_movie_info(title, expected_year=None, allow_network=True):
+    """
+    Best-effort TMDB movie match for canonical title/year formatting.
+    Returns dict: {"tmdb_name": str, "tmdb_year": int|None, "tmdb_id": int|None}
+    """
+    if not TMDB_API_KEY or not title or not allow_network:
+        return None
+
+    raw_title = str(title or "").strip()
+    if not raw_title:
+        return None
+
+    # Strip "(YYYY)" suffix if present.
+    title_clean = raw_title
+    year_match = re.search(r"\s*\((\d{4})\)\s*$", raw_title)
+    if year_match:
+        title_clean = raw_title.replace(year_match.group(0), "").strip()
+        if expected_year is None:
+            expected_year = _coerce_int(year_match.group(1), None)
+
+    try:
+        expected_year = _coerce_int(expected_year, None)
+    except Exception:
+        expected_year = None
+
+    qnorm = _norm_title(title_clean)
+
+    def tmdb_get_results(url, params):
+        try:
+            r = requests.get(
+                url,
+                params=params,
+                timeout=8,
+            )
+            if r.status_code != 200:
+                return []
+            j = r.json() or {}
+            return j.get("results") or []
+        except Exception:
+            return []
+
+    def score_item(it):
+        cand_title = (it.get("title") or it.get("original_title") or "").strip()
+        cnorm = _norm_title(cand_title)
+        score = _score_title(qnorm, cnorm)
+        # Prefer results that have posters (helps ensure the next poster fetch succeeds).
+        if it.get("poster_path"):
+            score += 15
+        if expected_year:
+            d = (it.get("release_date") or "")[:4]
+            if d.isdigit():
+                dy = int(d)
+                if abs(dy - int(expected_year)) <= 1:
+                    score += 20
+        return score
+
+    params = {"api_key": TMDB_API_KEY, "query": title_clean, "language": "en-US"}
+    if expected_year:
+        params["year"] = int(expected_year)
+    results = tmdb_get_results("https://api.themoviedb.org/3/search/movie", params)
+
+    # Fallback: drop year filter
+    if not results and expected_year:
+        params2 = {"api_key": TMDB_API_KEY, "query": title_clean, "language": "en-US"}
+        results = tmdb_get_results("https://api.themoviedb.org/3/search/movie", params2)
+
+    # Fallback: multi search (matches get_tmdb_poster behavior)
+    if not results:
+        params3 = {"api_key": TMDB_API_KEY, "query": title_clean, "language": "en-US"}
+        multi = tmdb_get_results("https://api.themoviedb.org/3/search/multi", params3)
+        results = [it for it in (multi or []) if it.get("media_type") == "movie"]
+
+    if not results:
+        return None
+
+    best = None
+    best_score = -1
+    for it in (results or [])[:25]:
+        try:
+            s = score_item(it)
+            if s > best_score:
+                best_score = s
+                best = it
+        except Exception:
+            continue
+
+    if not best:
+        return None
+
+    tmdb_name = (best.get("title") or best.get("original_title") or "").strip()
+    ry = None
+    try:
+        d = (best.get("release_date") or "")[:4]
+        if d.isdigit():
+            ry = int(d)
+    except Exception:
+        ry = None
+
+    return {"tmdb_name": tmdb_name, "tmdb_year": ry, "tmdb_id": best.get("id")}
+
     
 def get_tmdb_series_info(series_name, expected_year=None, force_refresh=False, allow_network=True):
     if not TMDB_API_KEY:
@@ -1069,6 +1210,375 @@ def append_record(record):
     cache["sig"] = None
     refresh_history_sig_fast()
 
+def _tail_json_records(path, max_lines=400, chunk_size=8192):
+    """
+    Read up to the last `max_lines` JSONL records from `path` efficiently.
+    Returns a list of parsed dicts in file order (oldest -> newest for the tail).
+    """
+    if max_lines <= 0:
+        return []
+    try:
+        if not os.path.exists(path):
+            return []
+        size = os.path.getsize(path)
+        if size <= 0:
+            return []
+        buf = b""
+        lines = []
+        with open(path, "rb") as f:
+            pos = size
+            while pos > 0 and len(lines) < (max_lines + 5):
+                read_size = chunk_size if pos >= chunk_size else pos
+                pos -= read_size
+                f.seek(pos)
+                chunk = f.read(read_size)
+                buf = chunk + buf
+                parts = buf.split(b"\n")
+                buf = parts[0]  # partial first line
+                for ln in parts[1:][::-1]:
+                    if ln.strip():
+                        lines.append(ln)
+                        if len(lines) >= (max_lines + 5):
+                            break
+            lines = lines[: max_lines]
+            lines.reverse()
+        out = []
+        for ln in lines:
+            try:
+                out.append(json.loads(ln.decode("utf-8", errors="replace")))
+            except Exception:
+                continue
+        return out
+    except Exception:
+        return []
+
+def _record_dedupe_key(r):
+    """
+    Best-effort dedupe key across webhook/poll/import sources.
+    Uses second-level timestamp resolution to avoid duplicates on repeated sync.
+    """
+    try:
+        ts = str(r.get("timestamp") or "")[:19]
+        t = str(r.get("type") or "")
+        user = str(r.get("user") or "")
+        if t.lower() == "episode":
+            return ("Episode", str(r.get("series_name") or ""), _coerce_int(r.get("season"), 0) or 0, _coerce_int(r.get("episode"), 0) or 0, user, ts)
+        if t.lower() == "movie":
+            return ("Movie", str(r.get("name") or ""), _coerce_int(r.get("year"), 0) or 0, user, ts)
+        return (t, str(r.get("name") or ""), user, ts)
+    except Exception:
+        return None
+
+def _record_dedupe_key_loose(r):
+    """
+    Dedupe key that ignores timestamp. Used to avoid poll/webhook duplicates when
+    timestamps differ (webhook uses receive time; poll uses Jellyfin LastPlayedDate).
+    """
+    try:
+        t = str(r.get("type") or "")
+        user = str(r.get("user") or "")
+        if t.lower() == "episode":
+            return ("Episode", str(r.get("series_name") or ""), _coerce_int(r.get("season"), 0) or 0, _coerce_int(r.get("episode"), 0) or 0, user)
+        if t.lower() == "movie":
+            return ("Movie", str(r.get("name") or ""), _coerce_int(r.get("year"), 0) or 0, user)
+        return (t, str(r.get("name") or ""), user)
+    except Exception:
+        return None
+
+def _parse_iso_to_epoch_seconds(value):
+    """
+    Parse ISO-ish timestamps like:
+    - 2026-02-13T10:20:30Z
+    - 2026-02-13T10:20:30.1234567Z
+    - 2026-02-13T10:20:30.123+00:00
+    Returns int epoch seconds (UTC) or 0 on failure.
+    """
+    try:
+        s = str(value or "").strip()
+        if not s:
+            return 0
+        # Normalize Zulu timestamps to offset format
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        # Trim fractional seconds to microseconds if present
+        if "." in s:
+            # split on timezone separator if any
+            tz_pos = max(s.rfind("+"), s.rfind("-"))
+            if tz_pos > s.find("T"):
+                main = s[:tz_pos]
+                tz = s[tz_pos:]
+            else:
+                main = s
+                tz = ""
+            if "." in main:
+                left, frac = main.split(".", 1)
+                frac_digits = "".join(ch for ch in frac if ch.isdigit())
+                frac_digits = (frac_digits + "000000")[:6]
+                main = left + "." + frac_digits
+            s = main + tz
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            # Assume UTC if no tz present
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp())
+    except Exception:
+        return 0
+
+def _append_records_batch(records):
+    if not records:
+        return
+    os.makedirs("/data", exist_ok=True)
+    with open(DATA_FILE, "a") as f:
+        for r in records:
+            f.write(json.dumps(r) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+    cache["time"] = None
+    cache["sig"] = None
+    refresh_history_sig_fast()
+
+def jellyfin_poll_sync_once():
+    """
+    Poll Jellyfin for newly played items since the last poll state.
+    This is a fallback when playback-stop webhooks are missed (e.g. "Next episode" flows).
+    """
+    if not (JELLYFIN_POLL_ENABLED and JELLYFIN_URL and JELLYFIN_API_KEY):
+        return 0
+    try:
+        interval = int(JELLYFIN_POLL_INTERVAL_S or 60)
+        if interval < 15:
+            interval = 15
+    except Exception:
+        interval = 60
+
+    try:
+        headers = {"X-Emby-Token": JELLYFIN_API_KEY}
+        state = load_json_file(JELLYFIN_POLL_STATE_FILE)
+        if not isinstance(state, dict):
+            state = {}
+
+        user_id = state.get("user_id")
+        user_name = state.get("user_name")
+        last_ts = _coerce_int(state.get("last_ts"), 0) or 0
+        last_ids = state.get("last_ids") or []
+        if not isinstance(last_ids, list):
+            last_ids = []
+        last_ids = [str(x) for x in last_ids if x]
+        seen_map = state.get("seen") or {}
+        if not isinstance(seen_map, dict):
+            seen_map = {}
+
+        now_epoch = int(time.time())
+        # If the saved timestamp is in the future (clock skew or bad parsing),
+        # clamp it so we don't skip real new plays.
+        if last_ts > (now_epoch + 60):
+            last_ts = max(0, now_epoch - 3600)
+
+        lookback = _coerce_int(JELLYFIN_POLL_LOOKBACK_S, 0) or 0
+        if lookback < 300:
+            lookback = 300
+        lookback_cutoff = max(0, now_epoch - lookback)
+
+        # First-run: derive a safe baseline from our own history tail so we don't import everything.
+        if last_ts <= 0:
+            tail = _tail_json_records(DATA_FILE, max_lines=200)
+            mx = 0
+            for r in tail:
+                ts = _parse_iso_to_epoch_seconds(r.get("timestamp"))
+                if ts > mx:
+                    mx = ts
+            if mx > 0:
+                # Go slightly back to avoid missing same-second plays.
+                last_ts = max(0, int(mx) - 5)
+            else:
+                # No local history yet: only look back a little so we don't import
+                # the user's entire played history on first boot.
+                last_ts = max(0, int(time.time()) - 3600)
+            last_ids = []
+
+        if not user_id or not user_name:
+            try:
+                r = requests.get(f"{JELLYFIN_URL}/Users", headers=headers, timeout=15)
+                if r.status_code == 200:
+                    users = r.json() or []
+                    if users:
+                        user_id = users[0].get("Id")
+                        user_name = users[0].get("Name")
+            except Exception:
+                pass
+
+        if not user_id:
+            return 0
+        if not user_name:
+            user_name = "Unknown"
+
+        params = {
+            "Filters": "IsPlayed",
+            "Recursive": "true",
+            "Fields": "Genres,UserData",
+            "IncludeItemTypes": "Movie,Episode",
+            "StartIndex": 0,
+            "Limit": int(JELLYFIN_POLL_LIMIT or 80),
+            "SortBy": "DatePlayed",
+            "SortOrder": "Descending",
+        }
+        r2 = requests.get(f"{JELLYFIN_URL}/Users/{user_id}/Items", headers=headers, params=params, timeout=20)
+        if r2.status_code != 200:
+            return 0
+        page = r2.json() or {}
+        items = page.get("Items", []) or []
+
+        # Dedupe against the tail of our local history (covers webhook+poll overlaps).
+        tail_recent = _tail_json_records(DATA_FILE, max_lines=400)
+        recent_keys = set()
+        recent_loose = set()
+        for rr in tail_recent:
+            k = _record_dedupe_key(rr)
+            if k:
+                recent_keys.add(k)
+            lk = _record_dedupe_key_loose(rr)
+            if lk:
+                recent_loose.add(lk)
+
+        new_records = []
+        seen_ts = last_ts
+        seen_ids = set(last_ids)
+        for it in items:
+            try:
+                it_id = str(it.get("Id") or "")
+                last_played = (it.get("UserData") or {}).get("LastPlayedDate")
+                ts = _parse_iso_to_epoch_seconds(last_played)
+                if ts <= 0:
+                    continue
+
+                # Only consider recent plays; prevents the poller from backfilling
+                # your entire Jellyfin "played" history.
+                if ts < lookback_cutoff:
+                    continue
+
+                # Per-item guard: if we've already seen this Jellyfin item played at
+                # this timestamp, skip it even if global last_ts is wrong.
+                prev_seen = _coerce_int(seen_map.get(it_id), 0) or 0
+                if it_id and ts <= prev_seen:
+                    continue
+
+                rec = {
+                    "timestamp": last_played,
+                    "type": it.get("Type"),
+                    "name": it.get("Name"),
+                    "year": it.get("ProductionYear"),
+                    "series_name": it.get("SeriesName"),
+                    "season": it.get("ParentIndexNumber"),
+                    "episode": it.get("IndexNumber"),
+                    "user": user_name,
+                    "genres": it.get("Genres", []) or [],
+                    "source": "poll",
+                    "jellyfin_id": it_id,
+                }
+                k = _record_dedupe_key(rec)
+                lk = _record_dedupe_key_loose(rec)
+                if k and k in recent_keys:
+                    # Already in local history (likely via webhook/import)
+                    pass
+                elif lk and lk in recent_loose:
+                    # Same item already present but timestamp differs (common when webhook vs poll)
+                    pass
+                else:
+                    new_records.append((ts, it_id, rec))
+                if it_id:
+                    seen_map[it_id] = int(ts)
+            except Exception:
+                continue
+
+        if not new_records:
+            # Persist updated user info / baseline if needed
+            state["user_id"] = user_id
+            state["user_name"] = user_name
+            state["last_ts"] = last_ts
+            state["last_ids"] = last_ids
+            save_json_file(JELLYFIN_POLL_STATE_FILE, state)
+            return 0
+
+        # Append in chronological order (oldest first)
+        new_records.sort(key=lambda x: x[0])
+        to_append = []
+        for ts, it_id, rec in new_records:
+            to_append.append(rec)
+            if ts > seen_ts:
+                seen_ts = ts
+                seen_ids = set([it_id] if it_id else [])
+            elif ts == seen_ts and it_id:
+                seen_ids.add(it_id)
+
+            # Queue TMDB work for new items (non-blocking)
+            try:
+                rtype = str(rec.get("type") or "").strip().lower()
+                if rtype == "movie":
+                    _queue_tmdb_poster_fetch(rec.get("name"), rec.get("year"), "movie")
+                elif rtype == "episode":
+                    _queue_tmdb_poster_fetch(rec.get("series_name") or rec.get("name"), rec.get("year"), "tv")
+                    _queue_tmdb_series_fetch(rec.get("series_name") or rec.get("name"), expected_year=None)
+            except Exception:
+                pass
+
+        _append_records_batch(to_append)
+        prewarm_organized_cache_async()
+        try:
+            print(f"✓ Jellyfin poll sync added {len(to_append)} new record(s)")
+        except Exception:
+            pass
+
+        # Trim seen_map if it grows too large (keep most recent plays).
+        try:
+            if len(seen_map) > 2000:
+                keep = 1200
+                items_seen = []
+                for k, v in seen_map.items():
+                    vv = _coerce_int(v, 0) or 0
+                    if k:
+                        items_seen.append((vv, k))
+                items_seen.sort(reverse=True)
+                keep_keys = set(k for _, k in items_seen[:keep])
+                seen_map = {k: seen_map[k] for k in keep_keys if k in seen_map}
+        except Exception:
+            pass
+
+        state["user_id"] = user_id
+        state["user_name"] = user_name
+        state["last_ts"] = int(seen_ts)
+        state["last_ids"] = sorted([x for x in seen_ids if x])[:200]
+        state["seen"] = seen_map
+        save_json_file(JELLYFIN_POLL_STATE_FILE, state)
+        return len(to_append)
+    except Exception:
+        return 0
+
+def start_jellyfin_poll_thread():
+    if not (JELLYFIN_POLL_ENABLED and JELLYFIN_URL and JELLYFIN_API_KEY):
+        return
+    try:
+        interval = int(JELLYFIN_POLL_INTERVAL_S or 60)
+        if interval < 15:
+            interval = 15
+    except Exception:
+        interval = 60
+    try:
+        print(f"✓ Jellyfin poll enabled: interval={interval}s limit={int(JELLYFIN_POLL_LIMIT or 80)}")
+    except Exception:
+        pass
+
+    def _run():
+        # small startup delay so the app is ready first
+        time.sleep(5)
+        while True:
+            try:
+                jellyfin_poll_sync_once()
+            except Exception:
+                pass
+            time.sleep(interval)
+
+    threading.Thread(target=_run, daemon=True).start()
+
 def prewarm_organized_cache_async():
     global _prewarm_busy
     with _prewarm_lock:
@@ -1301,13 +1811,16 @@ def organize_data():
                     "watch_count": 0,
                     "watches": [],
                     "genres": genres,
-                    "poster": None
+                    "poster": None,
+                    "jellyfin_id": r.get("jellyfin_id"),
                 }
             elif genres:
                 merged = _normalize_genres((movies[key].get("genres") or []) + genres)
                 movies[key]["genres"] = merged
+            if not movies[key].get("jellyfin_id") and r.get("jellyfin_id"):
+                movies[key]["jellyfin_id"] = r.get("jellyfin_id")
             movies[key]["watch_count"] += 1
-            movies[key]["watches"].append({"timestamp": r.get("timestamp"), "user": r.get("user")})
+            movies[key]["watches"].append({"timestamp": r.get("timestamp"), "user": r.get("user"), "jellyfin_id": r.get("jellyfin_id")})
             for g in genres:
                 genre_counter[g] += 1
 
@@ -1319,10 +1832,13 @@ def organize_data():
                     "seasons": {},
                     "genres": genres,
                     "poster": None,
-                    "year": r.get("year")
+                    "year": r.get("year"),
+                    "jellyfin_series_id": r.get("jellyfin_series_id"),
                 }
             elif not shows[series].get("year") and r.get("year"):
                 shows[series]["year"] = r.get("year")
+            if not shows[series].get("jellyfin_series_id") and r.get("jellyfin_series_id"):
+                shows[series]["jellyfin_series_id"] = r.get("jellyfin_series_id")
             if genres:
                 merged = _normalize_genres((shows[series].get("genres") or []) + genres)
                 shows[series]["genres"] = merged
@@ -1344,7 +1860,9 @@ def organize_data():
             for ep in ep_list:
                 if ep["episode"] == ep_no:
                     ep["watch_count"] += 1
-                    ep["watches"].append({"timestamp": r.get("timestamp"), "user": r.get("user")})
+                    ep["watches"].append({"timestamp": r.get("timestamp"), "user": r.get("user"), "jellyfin_id": r.get("jellyfin_id")})
+                    if r.get("jellyfin_id"):
+                        ep["jellyfin_id"] = r.get("jellyfin_id")
                     found = True
                     break
             
@@ -1354,7 +1872,8 @@ def organize_data():
                     "season": season,
                     "episode": ep_no,
                     "watch_count": 1,
-                    "watches": [{"timestamp": r.get("timestamp"), "user": r.get("user")}]
+                    "watches": [{"timestamp": r.get("timestamp"), "user": r.get("user"), "jellyfin_id": r.get("jellyfin_id")}],
+                    "jellyfin_id": r.get("jellyfin_id"),
                 })
 
     for m in movies.values():
@@ -1846,7 +2365,7 @@ def jellyfin_import():
                     last_played = item.get("UserData", {}).get("LastPlayedDate")
                     if not last_played:
                         continue
-                    
+                     
                     record = {
                         "timestamp": last_played,
                         "type": item.get("Type"),
@@ -1858,6 +2377,7 @@ def jellyfin_import():
                         "user": user_name,
                         "genres": item.get("Genres", []),
                         "source": "import",
+                        "jellyfin_id": item.get("Id"),
                     }
                     f.write(json.dumps(record) + "\n")
                     imported += 1
@@ -2026,7 +2546,7 @@ def radarr_import():
 @app.route("/")
 def index():
     return """<!DOCTYPE html>
-<html><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no"/><title>Jellyfin Watch Tracker</title>
+<html><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1.0"/><title>Jellyfin Watch Tracker</title>
 <style>html,body{background:#0a0e27;color:#fff;}</style>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <style>
@@ -2193,9 +2713,51 @@ input::placeholder{color:rgba(255,255,255,0.4)}
 .form-group label{display:block;color:rgba(255,255,255,0.8);font-weight:600;margin-bottom:6px;font-size:0.9em}
 .zoom-control{display:flex;align-items:center;gap:10px;background:rgba(20,25,45,0.6);backdrop-filter:blur(10px);padding:10px 15px;border-radius:12px;border:1px solid rgba(255,255,255,0.08)}
 .zoom-control label{color:rgba(255,255,255,0.7);font-size:0.85em;font-weight:600;white-space:nowrap}
-.zoom-slider{width:130px;height:5px;border-radius:5px;background:rgba(255,255,255,0.1);outline:none;-webkit-appearance:none}
-.zoom-slider::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;width:16px;height:16px;border-radius:50%;background:linear-gradient(135deg,#8b9cff,#6b8cff);cursor:pointer;box-shadow:0 2px 8px rgba(139,156,255,0.5)}
-.zoom-slider::-moz-range-thumb{width:16px;height:16px;border-radius:50%;background:linear-gradient(135deg,#8b9cff,#6b8cff);cursor:pointer;border:none;box-shadow:0 2px 8px rgba(139,156,255,0.5)}
+.zoom-slider{
+  width:140px;
+  height:22px;
+  background:transparent;
+  outline:none;
+  border:0;
+  padding:0;
+  -webkit-appearance:none;
+  appearance:none;
+}
+.zoom-slider:focus{outline:none}
+.zoom-slider::-webkit-slider-runnable-track{
+  height:6px;
+  border-radius:999px;
+  background:rgba(255,255,255,0.14);
+  border:1px solid rgba(255,255,255,0.10);
+}
+.zoom-slider::-webkit-slider-thumb{
+  -webkit-appearance:none;
+  appearance:none;
+  width:16px;
+  height:16px;
+  border-radius:50%;
+  background:linear-gradient(135deg,var(--accent,#8b9cff),var(--accent2,#6b8cff));
+  cursor:pointer;
+  box-shadow:0 2px 8px rgba(139,156,255,0.5);
+  margin-top:-6px; /* center thumb on 6px track */
+}
+.zoom-slider::-moz-range-track{
+  height:6px;
+  border-radius:999px;
+  background:rgba(255,255,255,0.14);
+  border:1px solid rgba(255,255,255,0.10);
+}
+.zoom-slider::-moz-range-thumb{
+  width:16px;
+  height:16px;
+  border-radius:50%;
+  background:linear-gradient(135deg,var(--accent,#8b9cff),var(--accent2,#6b8cff));
+  cursor:pointer;
+  border:0;
+  box-shadow:0 2px 8px rgba(139,156,255,0.5);
+}
+.zoom-slider::-moz-focus-outer{border:0}
+.zoom-slider::-ms-track{background:transparent;border-color:transparent;color:transparent}
 .zoom-value{color:#8b9cff;font-weight:700;font-size:0.9em;min-width:40px}
 .view-toggle{display:flex;gap:6px}
 .view-toggle button{background:rgba(139,156,255,0.15);border:2px solid rgba(139,156,255,0.3);color:#8b9cff;padding:7px 14px;border-radius:10px;cursor:pointer;font-weight:600;font-size:12px;transition:all 0.3s}
@@ -2279,6 +2841,23 @@ body.grid-select-mode .grid-item{
 .action-buttons{display:flex;gap:5px;flex-wrap:wrap;margin-top:8px}
 .manage-actions{opacity:0;transition:opacity 0.3s}
 .show-group:hover .manage-actions{opacity:1}
+/* Movie actions were unintentionally hidden (no hover rule). Always show for movies. */
+.movie-item .manage-actions{opacity:1}
+.movie-item:hover .manage-actions{opacity:1}
+
+/* Make Jellyfin link buttons more visible and touch-friendly */
+.btn.linkout{
+  background: linear-gradient(135deg, rgba(111,130,255,0.85), rgba(95,115,255,0.85)) !important;
+  border: 1px solid rgba(255,255,255,0.14) !important;
+  color: #fff !important;
+  font-weight: 700;
+}
+.btn.linkout:hover{
+  background: linear-gradient(135deg, rgba(111,130,255,0.92), rgba(95,115,255,0.92)) !important;
+}
+.btn.linkout.small{
+  min-width: 46px;
+}
 .season-actions{opacity:0;transition:opacity 0.3s}
 .season-group:hover .season-actions{opacity:1}
 .import-section{background:rgba(20,25,45,0.8);backdrop-filter:blur(10px);border-radius:16px;padding:20px;margin-bottom:20px;border:1px solid rgba(255,255,255,0.08)}
@@ -2788,6 +3367,12 @@ img {
   * {
     transition-duration: 0.15s !important;
   }
+
+  /* No hover on touch: keep actions visible */
+  .manage-actions{ opacity: 1 !important; }
+  .episode-item .delete-btn{ opacity: 1 !important; }
+  .grid-item-actions{ opacity: 1 !important; }
+  .grid-item-actions .btn{ min-width: 44px; min-height: 44px; }
 }
 
 /* Detect very low-end devices (old Android, budget phones) */
@@ -3235,6 +3820,187 @@ html.layout-spacious .grid-view{
   }
 }
 
+/* ================= RESPONSIVE POLISH PACK =================
+   Goals:
+   - Fluid spacing + typography across phone/tablet/desktop
+   - Touch-friendly controls and better small-screen layout
+   - Overrides only (keeps existing behavior/JS intact)
+   ========================================================== */
+
+:root{
+  --pagePad: clamp(10px, 2.2vw, 18px);
+  --panelPad: clamp(12px, 2.0vw, 18px);
+  --radius: 16px;
+  --radiusLg: 20px;
+}
+
+body{
+  /* Respect mobile safe areas (iOS notch), env() resolves to 0 elsewhere */
+  padding: calc(var(--pagePad) + env(safe-area-inset-top))
+           calc(var(--pagePad) + env(safe-area-inset-right))
+           calc(var(--pagePad) + env(safe-area-inset-bottom))
+           calc(var(--pagePad) + env(safe-area-inset-left)) !important;
+}
+
+.container{
+  max-width: 1600px;
+  padding-inline: clamp(0px, 1vw, 10px);
+}
+
+.header{
+  padding: clamp(16px, 2.4vw, 26px) !important;
+  border-radius: var(--radiusLg) !important;
+}
+
+.header h1{
+  font-size: clamp(1.35rem, 2.4vw, 2.1rem) !important;
+}
+
+.logo{
+  font-size: clamp(1.8rem, 3.2vw, 2.2rem) !important;
+}
+
+/* Tabs: allow horizontal scroll on small screens instead of awkward wrapping */
+.tabs{
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  scroll-snap-type: x mandatory;
+  scrollbar-width: none;
+}
+.tabs::-webkit-scrollbar{ display:none; }
+.tab-btn{
+  scroll-snap-align: start;
+  white-space: nowrap;
+}
+
+/* Touch targets: make tap interactions reliable */
+button, .btn, select, input{
+  touch-action: manipulation;
+}
+.btn, button, .tab-btn, select, input{
+  min-height: 42px;
+}
+
+:focus-visible{
+  outline: 2px solid var(--borderSoft);
+  outline-offset: 2px;
+}
+
+/* Stats grid: keep readable on phones */
+@media (max-width: 900px){
+  .stats{ grid-template-columns: repeat(3, minmax(0, 1fr)) !important; }
+}
+@media (max-width: 640px){
+  .tabs{ flex-wrap: nowrap !important; }
+  .stats{ grid-template-columns: repeat(2, minmax(0, 1fr)) !important; }
+}
+@media (max-width: 420px){
+  .stats{ grid-template-columns: 1fr !important; }
+}
+
+/* Header toolbar: turn into a clean grid on phones */
+@media (max-width: 900px){
+  .header-toolbar{ width:100%; justify-content:flex-start; }
+}
+@media (max-width: 640px){
+  .header-toolbar{
+    display:grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 10px;
+    justify-content: stretch;
+    width: 100%;
+  }
+  .zoom-control{
+    grid-column: 1 / -1;
+    height: auto;
+  }
+  .auto-refresh{
+    grid-column: 1 / -1;
+    justify-content: space-between;
+    width: 100%;
+  }
+  .header-toolbar .btn{
+    width: 100%;
+    min-width: 0;
+    height: 52px;
+  }
+}
+
+/* Filters: make inputs wrap cleanly on smaller screens */
+.filters, .advanced-filters{
+  padding: var(--panelPad) !important;
+}
+.search-box{
+  min-width: min(320px, 100%) !important;
+}
+
+/* Pending TMDB totals: make it discoverable + usable */
+.tmdb-pending-total{
+  cursor:pointer;
+  text-decoration: underline dotted rgba(255,255,255,0.35);
+  text-underline-offset: 3px;
+  -webkit-touch-callout: none;
+}
+
+.tmdb-pending-total:hover{
+  text-decoration-color: rgba(255,255,255,0.55);
+}
+
+/* List view: stack poster/content on phones to avoid cramped rows */
+@media (max-width: 640px){
+  .movie-item, .show-group{
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .poster-container{
+    display:flex;
+    justify-content:center;
+  }
+  .movie-item .poster,
+  .show-group .poster,
+  .movie-item .poster-placeholder,
+  .show-group .poster-placeholder{
+    width: min(220px, 100%) !important;
+    height: auto !important;
+    aspect-ratio: 2 / 3;
+  }
+}
+
+/* Grid view: predictable columns across device sizes */
+@media (max-width: 640px){
+  .grid-view{
+    grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+    gap: 12px !important;
+  }
+  html.layout-compact .grid-view,
+  html.layout-spacious .grid-view{
+    grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+  }
+  .grid-item .poster,
+  .grid-item .poster-placeholder{
+    height: 180px !important;
+  }
+}
+@media (max-width: 420px){
+  .grid-view{ grid-template-columns: 1fr !important; }
+  .grid-item .poster,
+  .grid-item .poster-placeholder{
+    height: 220px !important;
+  }
+}
+
+/* Chart panels: full width on phones */
+@media (max-width: 640px){
+  .chart-container{
+    max-width: 100% !important;
+    padding: 16px !important;
+  }
+  #genreChart{
+    max-width: 240px !important;
+    max-height: 240px !important;
+  }
+}
+
 /* === FIX 1: force Layout dropdown row below the view-toggle buttons === */
 #layoutRow {
   flex-basis: 100% !important;
@@ -3617,18 +4383,15 @@ html.layout-spacious .grid-view{
 <label>Content Type</label>
 <div class="radio-group">
 <label><input type="radio" name="entryType" value="Movie" checked onchange="toggleEpisodeFields()"> 🎬 Movie</label>
-<label><input type="radio" name="entryType" value="Episode" onchange="toggleEpisodeFields()"> 📺 TV Episode</label>
+<label><input type="radio" name="entryType" value="Episode" onchange="toggleEpisodeFields()"> 📺 Show</label>
 </div>
 </div>
 
+<div id="movieFields" class="movie-fields">
 <div class="form-group">
-<label>Title / Episode Name</label>
-<input type="text" id="entryName" placeholder="e.g., The Dark Knight">
+<label>Movie Title</label>
+<input type="text" id="entryMovieTitle" placeholder="e.g., The Dark Knight">
 </div>
-
-<div class="form-group">
-<label>Year (optional)</label>
-<input type="number" id="entryYear" placeholder="e.g., 2024" min="1900" max="2026">
 </div>
 
 <div id="episodeFields" class="episode-fields">
@@ -3643,14 +4406,19 @@ html.layout-spacious .grid-view{
 </div>
 
 <div class="form-group">
-<label>Episode Number</label>
-<input type="number" id="entryEpisode" placeholder="e.g., 1" min="1">
+<label>Episode Number / Range (optional)</label>
+<input type="text" id="entryEpisodeSpec" placeholder="e.g., 1  or  1,2,5-8">
+</div>
+
+<div class="form-group">
+<label>Episode Name (optional)</label>
+<input type="text" id="entryEpisodeName" placeholder="Optional (TMDB will be used when available)">
 </div>
 </div>
 
 <div class="form-group">
-<label>Watch Date</label>
-<input type="date" id="entryDate">
+<label>Year (optional)</label>
+<input type="number" id="entryYear" placeholder="e.g., 2008" min="1900" max="2026">
 </div>
 
 <div class="form-group">
@@ -3658,7 +4426,12 @@ html.layout-spacious .grid-view{
 <input type="text" id="entryGenres" placeholder="e.g., Drama, Thriller">
 </div>
 
-<button class="btn" style="width:100%;margin-top:15px" onclick="submitManualEntry()">✓ Add Watch Record</button>
+<div class="form-group">
+<label>Watch Date</label>
+<input type="date" id="entryDate">
+</div>
+
+<button class="btn" id="manualEntrySubmitBtn" style="width:100%;margin-top:15px" onclick="submitManualEntry()">✓ Add Watch Record</button>
 </div>
 </div>
 
@@ -3679,7 +4452,7 @@ html.layout-spacious .grid-view{
 
 <div class="form-group">
 <label>Episode Number</label>
-<input type="text" id="entryEpisode" placeholder="e.g., 1  or  1,2,5-8">
+<input type="number" id="addEpEpisode" placeholder="e.g., 1" min="1" step="1">
 </div>
 
 <div class="form-group checkbox-group">
@@ -4418,6 +5191,13 @@ async function load(){
     data = cached.data;
     historySig = data.sig || historySig;
   }
+  // Load safe server config (e.g., Jellyfin public URL for deep links)
+  try{
+    const cfg = await fetchJsonWithTimeout('/api/config', 2500);
+    window.__appConfig = cfg || {};
+  }catch(e){
+    window.__appConfig = window.__appConfig || {};
+  }
   const savedTab = localStorage.getItem('currentTab');
   
   // Theme & layout restore: prefer saved theme in localStorage
@@ -4930,12 +5710,41 @@ function getLastEpisodeInfo(show){
         );
         if(betterByTime || sameTimeBetterEpisode){
           const epName = ep.name || ep.title || ep.episode_name || ep.episode_title || '';
-          best = { t, season: seasonNum, episode: epNum, name: epName, timestamp: w.timestamp };
+          best = { t, season: seasonNum, episode: epNum, name: epName, timestamp: w.timestamp, jellyfin_id: w.jellyfin_id || ep.jellyfin_id || null };
         }
       }
     }
   }
   return best;
+}
+
+function getJellyfinItemUrl(itemId){
+  const cfg = window.__appConfig || {};
+  const baseRaw = (cfg.jellyfin_public_url || '').trim();
+  const base = baseRaw.replace(new RegExp('/+$'), '');
+  if(!base || !itemId) return '';
+  // Support both "https://host/jellyfin" and "https://host/jellyfin/web"
+  const isWebBase = new RegExp('/web$', 'i').test(base);
+  const prefix = isWebBase ? (base + '/index.html') : (base + '/web/index.html');
+  return `${prefix}#!/details?id=${encodeURIComponent(String(itemId))}`;
+}
+
+function openInJellyfin(itemId){
+  const url = getJellyfinItemUrl(itemId);
+  if(!url){
+    alert('Jellyfin link not available. Set JELLYFIN_PUBLIC_URL (or JELLYFIN_URL) and ensure this item has a Jellyfin id.');
+    return;
+  }
+  // On mobile/touch devices, use same-window navigation so the OS can hand off
+  // to an installed app if it has registered to open Jellyfin URLs.
+  try{
+    const touchLike = (window.matchMedia && window.matchMedia('(hover: none)').matches) || (navigator.maxTouchPoints && navigator.maxTouchPoints > 0);
+    if(touchLike){
+      window.location.assign(url);
+      return;
+    }
+  }catch(e){}
+  window.open(url, '_blank', 'noopener');
 }
 
 function getTotalPossibleEpisodes(show){
@@ -4993,15 +5802,17 @@ function closePosterModal(){
 function openManualEntry(){
   document.getElementById('manualEntryModal').style.display='block';
   document.getElementById('entryDate').valueAsDate=new Date();
+  try{ toggleEpisodeFields(); }catch(e){}
 }
 
 function closeManualEntry(){
   document.getElementById('manualEntryModal').style.display='none';
-  document.getElementById('entryName').value='';
+  document.getElementById('entryMovieTitle').value='';
   document.getElementById('entryYear').value='';
   document.getElementById('entrySeriesName').value='';
   document.getElementById('entrySeason').value='';
-  document.getElementById('entryEpisode').value='';
+  document.getElementById('entryEpisodeSpec').value='';
+  document.getElementById('entryEpisodeName').value='';
   document.getElementById('entryGenres').value='';
   document.querySelectorAll('input[name="entryType"]')[0].checked=true;
   toggleEpisodeFields();
@@ -5010,10 +5821,13 @@ function closeManualEntry(){
 function toggleEpisodeFields(){
   const type=document.querySelector('input[name="entryType"]:checked').value;
   const fields=document.getElementById('episodeFields');
+  const movie=document.getElementById('movieFields');
   if(type==='Episode'){
     fields.classList.add('show');
+    if(movie) movie.style.display='none';
   }else{
     fields.classList.remove('show');
+    if(movie) movie.style.display='block';
   }
 }
 
@@ -5059,14 +5873,81 @@ function closeSettings(){
 
 async function submitManualEntry(){
   const type=document.querySelector('input[name="entryType"]:checked').value;
-  const name=document.getElementById('entryName').value.trim();
   const year=document.getElementById('entryYear').value;
   const date=document.getElementById('entryDate').value;
   const genresStr=document.getElementById('entryGenres').value.trim();
   
-    // Movie needs a title, Episode does not (we can use TMDB or fallback)
-  if(type==='Movie' && !name){
+  const yearInt = year ? parseInt(year) : null;
+  const genresList = genresStr ? genresStr.split(',').map(g=>g.trim()).filter(Boolean) : [];
+
+  const btn = document.getElementById('manualEntrySubmitBtn');
+  const btnOldText = btn ? btn.textContent : '';
+  const setBusy = (on, text) => {
+    if(!btn) return;
+    if(on){
+      btn.disabled = true;
+      btn.textContent = text || 'Adding...';
+      btn.style.opacity = '0.75';
+      btn.style.cursor = 'default';
+    }else{
+      btn.disabled = false;
+      btn.textContent = btnOldText || '✓ Add Watch Record';
+      btn.style.opacity = '';
+      btn.style.cursor = '';
+    }
+  };
+  const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+  const beginBusy = async (text) => {
+    setBusy(true, text);
+    // Give the browser a tick to paint the disabled/loading state.
+    await sleep(0);
+  };
+
+  if(type==='Movie'){
+    const title=document.getElementById('entryMovieTitle').value.trim();
+    if(!title){
     alert('Please enter a movie title');
+    return;
+  }
+    if(!date){
+      alert('Please select a watch date');
+      return;
+    }
+
+    const record={
+      timestamp:new Date(date+'T12:00:00').toISOString(),
+      type:'Movie',
+      name:title,
+      year:yearInt,
+      user:'Manual Entry',
+      genres:genresList,
+      source:'manual'
+    };
+
+    try{
+      const t0 = (performance && performance.now) ? performance.now() : Date.now();
+      await beginBusy('Adding movie...');
+      const r=await fetch('/api/manual_entry',{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify(record)
+      });
+      const result=await r.json();
+      if(result.success){
+        const t1 = (performance && performance.now) ? performance.now() : Date.now();
+        const elapsed = t1 - t0;
+        if(elapsed < 350) await sleep(350 - elapsed);
+        saveState(gridKeyMovie(title, yearInt));
+        closeManualEntry();
+        location.reload();
+      }else{
+        setBusy(false);
+        alert('Failed: '+result.error);
+      }
+    }catch(e){
+      setBusy(false);
+      alert('Error: '+e.message);
+    }
     return;
   }
   
@@ -5074,21 +5955,12 @@ async function submitManualEntry(){
     alert('Please select a watch date');
     return;
   }
-  
-  const record={
-    timestamp:new Date(date+'T12:00:00').toISOString(),
-    type:type,
-    name: (type==='Episode' && !name) ? 'Episode' : name,
-    year:year?parseInt(year):null,
-    user:'Manual Entry',
-    genres:genresStr?genresStr.split(',').map(g=>g.trim()):[],
-    source:'manual'
-  };
-  
-  if(type==='Episode'){
-    const seriesName=document.getElementById('entrySeriesName').value.trim();
-    const seasonRaw=(document.getElementById('entrySeason').value||'').trim();
-    const episodeSpec=(document.getElementById('entryEpisode').value||'').trim();
+
+  // Show (Episode records under the hood)
+  const seriesName=document.getElementById('entrySeriesName').value.trim();
+  const seasonRaw=(document.getElementById('entrySeason').value||'').trim();
+  const episodeSpec=(document.getElementById('entryEpisodeSpec').value||'').trim();
+  const episodeName=(document.getElementById('entryEpisodeName').value||'').trim();
 
     if(!seriesName){
       alert('Please enter series name');
@@ -5110,6 +5982,8 @@ async function submitManualEntry(){
 
     if(isBulkAllSeries || isBulkSeason || isBulkEpisodeSpec){
       try{
+        const t0 = (performance && performance.now) ? performance.now() : Date.now();
+        await beginBusy('Adding show...');
         const r = await fetch('/api/manual_tv_bulk', {
           method:'POST',
           headers:{'Content-Type':'application/json'},
@@ -5117,20 +5991,28 @@ async function submitManualEntry(){
             series_name: seriesName,
             season: seasonRaw ? parseInt(seasonRaw) : null,
             episode_spec: episodeSpec,
+            episode_name: episodeName,
+            year: yearInt,
+            genres: genresList,
             date: date,
             skip_tmdb: false
           })
         });
         const j = await r.json();
         if(j.success){
+          const t1 = (performance && performance.now) ? performance.now() : Date.now();
+          const elapsed = t1 - t0;
+          if(elapsed < 350) await sleep(350 - elapsed);
           alert(`✓ Added ${j.added} episodes`);
-          saveState(gridKeyShow(seriesName));
+          saveState(gridKeyShow(j.series_name || seriesName));
           closeManualEntry();
           location.reload();
         }else{
+          setBusy(false);
           alert('Failed: ' + (j.error || 'Unknown error'));
         }
       }catch(e){
+        setBusy(false);
         alert('Error: ' + e.message);
       }
       return;
@@ -5139,25 +6021,6 @@ async function submitManualEntry(){
     // Fallback (should not reach here)
     alert('Invalid episode input');
     return;
-  }
-  
-  try{
-    const r=await fetch('/api/manual_entry',{
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify(record)
-    });
-    const result=await r.json();
-    if(result.success){
-      saveState(gridKeyMovie(name, year ? parseInt(year) : null));
-      closeManualEntry();
-      location.reload();
-    }else{
-      alert('Failed: '+result.error);
-    }
-  }catch(e){
-    alert('Error: '+e.message);
-  }
 }
 
 async function submitAddEpisode(){
@@ -5540,6 +6403,111 @@ async function uploadPoster(){
   }
 }
 
+async function setManualShowTotal(seriesName){
+  try{
+    if(!seriesName) return;
+    const raw = prompt(`Set total episodes for "${seriesName}" (positive number):`, '');
+    if(raw === null) return;
+    const total = parseInt(String(raw).trim(), 10);
+    if(!Number.isFinite(total) || total <= 0){
+      alert('Please enter a positive number.');
+      return;
+    }
+    const r = await fetch('/api/set_show_total', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ series_name: seriesName, total: total })
+    });
+    const j = await r.json();
+    if(j && j.success){
+      quickReload();
+    } else {
+      alert('Failed: ' + ((j && j.error) || 'Unknown error'));
+    }
+  }catch(e){
+    alert('Error: ' + (e && e.message ? e.message : e));
+  }
+}
+
+function setupPendingTotalsInteractions(){
+  const root = document.getElementById('content');
+  if(!root || root.__pendingTotalsSetup) return;
+  root.__pendingTotalsSetup = true;
+
+  // Desktop: double click the pending totals text
+  root.addEventListener('dblclick', function(e){
+    const el = e.target && e.target.closest ? e.target.closest('.tmdb-pending-total') : null;
+    if(!el) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const enc = el.getAttribute('data-series-name') || '';
+    const seriesName = enc ? decodeURIComponent(enc) : '';
+    setManualShowTotal(seriesName);
+  });
+
+  // Touch: press and hold on the pending totals text
+  let lpTimer = null;
+  let startX = 0;
+  let startY = 0;
+  let lpFired = false;
+  let lpEl = null;
+
+  function clearLp(){
+    if(lpTimer){
+      clearTimeout(lpTimer);
+      lpTimer = null;
+    }
+    lpEl = null;
+  }
+
+  root.addEventListener('pointerdown', function(e){
+    const el = e.target && e.target.closest ? e.target.closest('.tmdb-pending-total') : null;
+    if(!el) return;
+    if(e.pointerType === 'mouse') return; // use dblclick for mouse
+    lpFired = false;
+    lpEl = el;
+    startX = e.clientX || 0;
+    startY = e.clientY || 0;
+    clearLp();
+    lpEl = el;
+    lpTimer = setTimeout(() => {
+      lpFired = true;
+      const enc = el.getAttribute('data-series-name') || '';
+      const seriesName = enc ? decodeURIComponent(enc) : '';
+      setManualShowTotal(seriesName);
+    }, 650);
+  }, { passive: true });
+
+  root.addEventListener('pointermove', function(e){
+    if(!lpTimer || !lpEl) return;
+    const dx = Math.abs((e.clientX || 0) - startX);
+    const dy = Math.abs((e.clientY || 0) - startY);
+    if(dx > 12 || dy > 12){
+      clearLp();
+    }
+  }, { passive: true });
+
+  root.addEventListener('pointerup', clearLp, { passive: true });
+  root.addEventListener('pointercancel', clearLp, { passive: true });
+
+  // Suppress the click that often follows a long-press so it doesn't toggle the show accordion.
+  root.addEventListener('click', function(e){
+    if(!lpFired) return;
+    const el = e.target && e.target.closest ? e.target.closest('.tmdb-pending-total') : null;
+    if(!el) return;
+    e.preventDefault();
+    e.stopPropagation();
+    lpFired = false;
+  }, true);
+
+  // Prevent mobile context menu from stealing the long-press gesture.
+  root.addEventListener('contextmenu', function(e){
+    const el = e.target && e.target.closest ? e.target.closest('.tmdb-pending-total') : null;
+    if(!el) return;
+    e.preventDefault();
+  });
+}
+
 function renderHistory(){
   const search=(document.getElementById('search').value||'').toLowerCase();
   const sort=document.getElementById('sort').value;
@@ -5633,10 +6601,10 @@ function renderHistory(){
   const remainingCount = Math.max(0, totalItemsAll - endIdx);
   const showLoadMoreButton = shouldShowLoadMore && (remainingCount > 0);
 
-if(viewMode==='grid'){
-  let html='<div class="grid-view">';
-  
-  movies.forEach(m=>{
+  if(viewMode==='grid'){
+   let html='<div class="grid-view">';
+   
+   movies.forEach(m=>{
     const poster=m.poster?`<img src="${m.poster}" class="poster" loading="lazy" decoding="async">`:`<div class="poster-placeholder">🎬</div>`;
     const movieNameEnc = encodeURIComponent(m.name || '').split("'").join('%27');
     const yearArg = (m.year === null || m.year === undefined) ? 'null' : m.year;
@@ -5647,14 +6615,17 @@ if(viewMode==='grid'){
     const gkeyJs = encodeURIComponent(gkey).split("'").join('%27');
     const gsel = selectedGridItems.has(gkey) ? ' grid-selected' : '';
     const gchk = selectedGridItems.has(gkey) ? 'checked' : '';
-    const itemJson = JSON.stringify(m).replace(/"/g, '&quot;');
-    const gridOnclick = gridSelectMode ? `event.stopPropagation();toggleGridItemSelection(decodeURIComponent('${gkeyJs}'))` : `gridMovieClick(decodeURIComponent('${movieNameEnc}'),${yearArg})`;
-    const checkboxOnclick = `event.stopPropagation();toggleGridItemSelection(decodeURIComponent('${gkeyJs}'))`;
-    
-    html += `<div class="grid-item${gsel}" data-grid-key="${gkeyAttr}" onclick="${gridOnclick}"><div class="grid-checkbox-wrap"><input type="checkbox" class="grid-select-checkbox" ${gchk} onclick="${checkboxOnclick}"></div><div class="grid-item-actions"><button class="btn manual small" title="Upload poster" onclick="event.stopPropagation();openPosterModal(${itemJson},'movie')">📷</button><button class="btn danger small" onclick="event.stopPropagation();deleteMovie(decodeURIComponent('${movieNameEnc}'),${yearArg})">✕</button></div><div class="poster-container">${poster}</div><div class="grid-item-title">${m.name}</div><div class="grid-item-info">${m.year||''} • ${m.watch_count}x</div><div class="grid-item-info">${lastDateTime ? `Last: ${lastDateTime}` : ``}</div></div>`;
-  });
-  
-  shows.forEach(s=>{
+     const itemJson = JSON.stringify(m).replace(/"/g, '&quot;');
+     const gridOnclick = gridSelectMode ? `event.stopPropagation();toggleGridItemSelection(decodeURIComponent('${gkeyJs}'))` : `gridMovieClick(decodeURIComponent('${movieNameEnc}'),${yearArg})`;
+     const checkboxOnclick = `event.stopPropagation();toggleGridItemSelection(decodeURIComponent('${gkeyJs}'))`;
+     const jfBtnGridMovie = m.jellyfin_id
+       ? `<button class="btn linkout small" title="Open in Jellyfin" onclick="event.stopPropagation();openInJellyfin(decodeURIComponent('${encodeURIComponent(String(m.jellyfin_id))}'))">🔗</button>`
+       : ``;
+     
+     html += `<div class="grid-item${gsel}" data-grid-key="${gkeyAttr}" onclick="${gridOnclick}"><div class="grid-checkbox-wrap"><input type="checkbox" class="grid-select-checkbox" ${gchk} onclick="${checkboxOnclick}"></div><div class="grid-item-actions"><button class="btn manual small" title="Upload poster" onclick="event.stopPropagation();openPosterModal(${itemJson},'movie')">📷</button>${jfBtnGridMovie}<button class="btn danger small" onclick="event.stopPropagation();deleteMovie(decodeURIComponent('${movieNameEnc}'),${yearArg})">✕</button></div><div class="poster-container">${poster}</div><div class="grid-item-title">${m.name}</div><div class="grid-item-info">${m.year||''} • ${m.watch_count}x</div><div class="grid-item-info">${lastDateTime ? `Last: ${lastDateTime}` : ``}</div></div>`;
+   });
+   
+   shows.forEach(s=>{
     const poster=s.poster?`<img src="${s.poster}" class="poster" loading="lazy" decoding="async">`:`<div class="poster-placeholder">📺</div>`;
     const comp=s.completion_percentage||0;
     const seasons=s.seasons||[];
@@ -5670,10 +6641,14 @@ if(viewMode==='grid'){
     const allAdded = s.auto_all_added;
     const gsel = isSelected ? ' grid-selected' : '';
     const showOnclick = gridSelectMode ? `event.stopPropagation();toggleGridItemSelection(decodeURIComponent('${keyJs}'))` : `gridItemClick(decodeURIComponent('${seriesNameEnc}'),true)`;
-    const showCheckbox = `event.stopPropagation();toggleGridItemSelection(decodeURIComponent('${keyJs}'))`;
-    
-    html+=`<div class="grid-item${gsel}" data-grid-key="${keyAttr}" onclick="${showOnclick}">${gridSelectMode ? `<div class="grid-checkbox-wrap"><input type="checkbox" class="grid-select-checkbox" ${isSelected ? 'checked' : ''} onclick="${showCheckbox}" ></div>` : ``}<div class="grid-item-actions"><button class="btn success small" title="Mark completed" onclick="event.stopPropagation();markComplete(decodeURIComponent('${seriesNameEnc}'))">✓</button><button class="btn danger small" title="Delete show" onclick="event.stopPropagation();deleteShow(decodeURIComponent('${seriesNameEnc}'))">🗑️</button></div><div class="poster-container">${poster}</div><div class="grid-item-title">${s.series_name}</div><div class="grid-item-info">${seasonInfo}</div>${lastGrid ? `<div class="grid-item-info">${lastGrid}</div>` : ``}<div class="grid-item-info">${allAdded ? `<span class="badge badge-info">All episodes added</span>` : ``} <span class="badge ${comp>=100 ? 'badge-success' : 'badge-warning'}">${comp}%</span></div></div>`;
-  });
+     const showCheckbox = `event.stopPropagation();toggleGridItemSelection(decodeURIComponent('${keyJs}'))`;
+     const jfGridShowId = s.jellyfin_series_id || (lastInfo && lastInfo.jellyfin_id) || null;
+     const jfBtnGridShow = jfGridShowId
+       ? `<button class="btn linkout small" title="Open in Jellyfin" onclick="event.stopPropagation();openInJellyfin(decodeURIComponent('${encodeURIComponent(String(jfGridShowId))}'))">🔗</button>`
+       : ``;
+     
+     html+=`<div class="grid-item${gsel}" data-grid-key="${keyAttr}" onclick="${showOnclick}">${gridSelectMode ? `<div class="grid-checkbox-wrap"><input type="checkbox" class="grid-select-checkbox" ${isSelected ? 'checked' : ''} onclick="${showCheckbox}" ></div>` : ``}<div class="grid-item-actions"><button class="btn success small" title="Mark completed" onclick="event.stopPropagation();markComplete(decodeURIComponent('${seriesNameEnc}'))">✓</button>${jfBtnGridShow}<button class="btn danger small" title="Delete show" onclick="event.stopPropagation();deleteShow(decodeURIComponent('${seriesNameEnc}'))">🗑️</button></div><div class="poster-container">${poster}</div><div class="grid-item-title">${s.series_name}</div><div class="grid-item-info">${seasonInfo}</div>${lastGrid ? `<div class="grid-item-info">${lastGrid}</div>` : ``}<div class="grid-item-info">${allAdded ? `<span class="badge badge-info">All episodes added</span>` : ``} <span class="badge ${comp>=100 ? 'badge-success' : 'badge-warning'}">${comp}%</span></div></div>`;
+   });
   
   html+='</div>';
   
@@ -5707,6 +6682,9 @@ if(viewMode==='grid'){
     const details = `${watchCount} watch${watchCount===1?'':'es'}${lastDateTime ? ` • Last: ${lastDateTime}` : ''}`;
     const genres = (m.genres || []).join(', ');
     
+    const jfBtnMovie = m.jellyfin_id
+      ? `<button class="btn linkout small" onclick="event.stopPropagation();openInJellyfin(decodeURIComponent('${encodeURIComponent(String(m.jellyfin_id))}'))">🔗 Jellyfin</button>`
+      : ``;
     html += `<div class="movie-item" data-movie-name="${movieNameEnc}">
       <div class="poster-container">
         ${poster}
@@ -5717,6 +6695,7 @@ if(viewMode==='grid'){
         <div class="movie-details">${details}</div>
         ${genres ? `<div class="movie-details">${genres}</div>` : ``}
         <div class="manage-actions">
+          ${jfBtnMovie}
           <button class="btn danger small" onclick="event.stopPropagation();deleteMovie(decodeURIComponent('${movieNameEnc}'),${yearArg})">🗑️ Delete Movie</button>
         </div>
       </div>
@@ -5735,14 +6714,22 @@ if(viewMode==='grid'){
     const compBadge = comp >= 100 ? 'badge-success' : 'badge-warning';
     const totalPossible = getTotalPossibleEpisodes(s);
     const totalWatched = s.total_episodes || 0;
-    const detailText = totalPossible
-      ? `${totalWatched}/${totalPossible} episodes watched`
-      : (s.tmdb_pending ? `${totalWatched}/? episodes watched (fetching TMDB totals...)` : `${totalWatched} episodes watched`);
+    const detailHtml = totalPossible
+      ? `<span class="episode-totals">${totalWatched}/${totalPossible} episodes watched</span>`
+      : (
+          s.tmdb_pending
+            ? `<span class="episode-totals tmdb-pending-total" data-series-name="${seriesNameEnc}" title="Double-click (desktop) or press and hold (touch) to set total episodes">${totalWatched}/? episodes watched (fetching TMDB totals...)</span>`
+            : `<span class="episode-totals">${totalWatched} episodes watched</span>`
+        );
     const lastInfo = getLastEpisodeInfo(s);
     const lastDate = formatDateTimeAmPm(lastInfo && lastInfo.timestamp);
     const lastLine = lastInfo ? `Last watched: S${lastInfo.season}E${lastInfo.episode}${lastInfo.name ? ` - ${lastInfo.name}` : ``}${lastDate ? ` | ${lastDate}` : ''}` : ``;
     const allAddedBadge = s.auto_all_added ? `<span class="badge badge-info">All episodes added</span>` : ``;
     const newContentBadge = s.has_new_content ? `<span class="badge badge-alert">New Content</span>` : ``;
+    const jfShowId = s.jellyfin_series_id || (lastInfo && lastInfo.jellyfin_id) || null;
+    const jfBtnShow = jfShowId
+      ? `<button class="btn linkout small" onclick="event.stopPropagation();openInJellyfin(decodeURIComponent('${encodeURIComponent(String(jfShowId))}'))">🔗 Jellyfin</button>`
+      : ``;
     
     let seasonsHtml = '';
     (s.seasons || []).forEach(season => {
@@ -5761,12 +6748,18 @@ if(viewMode==='grid'){
         const selectedClass = isSelected ? ' selected' : '';
         const checked = isSelected ? 'checked' : '';
         const rewatched = ep.watch_count > 1 ? ` <span class="badge badge-info">Rewatched ${ep.watch_count}x</span>` : '';
+        const jfEpBtn = ep.jellyfin_id
+          ? `<button class="btn linkout small" title="Open in Jellyfin" onclick="event.stopPropagation();openInJellyfin(decodeURIComponent('${encodeURIComponent(String(ep.jellyfin_id))}'))">🔗</button>`
+          : ``;
         episodesHtml += `<div class="episode-item${selectedClass}" onclick="event.stopPropagation();">
           <span>
             <input type="checkbox" class="select-checkbox" id="${checkboxId}" ${checked} onclick="event.stopPropagation();toggleEpisodeSelection(decodeURIComponent('${seriesNameEnc}'),${season.season_number},${ep.episode},event);return false;">
             <label for="${checkboxId}" style="cursor:pointer;user-select:none;">E${ep.episode}: ${ep.name}${rewatched}</label>
           </span>
-          <button class="btn danger small delete-btn" onclick="event.stopPropagation();deleteEpisode(decodeURIComponent('${seriesNameEnc}'),${season.season_number},${ep.episode})">🗑️</button>
+          <span style="display:flex;gap:6px;align-items:center;">
+            ${jfEpBtn}
+            <button class="btn danger small delete-btn" onclick="event.stopPropagation();deleteEpisode(decodeURIComponent('${seriesNameEnc}'),${season.season_number},${ep.episode})">🗑️</button>
+          </span>
         </div>`;
       });
       if(!episodesHtml){
@@ -5796,7 +6789,7 @@ if(viewMode==='grid'){
         <div class="show-header" onclick="toggle('${showId}')">
           <div>
             <div class="show-title">${s.series_name}</div>
-            <div class="movie-details">${detailText}</div>
+            <div class="movie-details">${detailHtml}</div>
             ${lastLine ? `<div class="movie-details">${lastLine}</div>` : ``}
           </div>
           <div style="display:flex;gap:6px;align-items:center;">
@@ -5807,6 +6800,7 @@ if(viewMode==='grid'){
         </div>
         <div class="progress-bar"><div class="progress-fill" style="width:${Math.min(comp,100)}%"></div></div>
         <div class="manage-actions" style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap;">
+          ${jfBtnShow}
           <button class="btn manual small" onclick="event.stopPropagation();openAddEpisode(decodeURIComponent('${seriesNameEnc}'))">➕ Episode</button>
           <button class="btn manual small" onclick="event.stopPropagation();openAddSeason(decodeURIComponent('${seriesNameEnc}'))">➕ Season</button>
           <button class="btn warning small" onclick="event.stopPropagation();markComplete(decodeURIComponent('${seriesNameEnc}'))">✓ Mark 100%</button>
@@ -7492,6 +8486,7 @@ async function renderWatchTime() {
 /* === End of advanced feature scripts === */
 
 load();
+setupPendingTotalsInteractions();
 </script></body></html>"""
 
 @app.route("/webhook", methods=["POST"])
@@ -7529,6 +8524,20 @@ def webhook():
         if _is_duplicate_webhook_event(dedupe_key):
             return jsonify({"success": True, "ignored": True, "duplicate": True})
 
+        # Jellyfin ids for deep-linking back to Jellyfin Web UI ("Open in Jellyfin").
+        try:
+            item_obj = (payload.get("Item") or {}) if isinstance(payload.get("Item"), dict) else {}
+        except Exception:
+            item_obj = {}
+        jellyfin_id = (
+            payload.get("ItemId") or payload.get("Id") or
+            item_obj.get("Id") or item_obj.get("ItemId")
+        )
+        jellyfin_series_id = (
+            payload.get("SeriesId") or item_obj.get("SeriesId") or
+            payload.get("SeriesID") or item_obj.get("SeriesID")
+        )
+
         record = {
             "timestamp": datetime.now().isoformat(),
             "type": item_type,
@@ -7540,6 +8549,8 @@ def webhook():
             "user": user,
             "genres": genres_norm,
             "source": "webhook",
+            "jellyfin_id": jellyfin_id,
+            "jellyfin_series_id": jellyfin_series_id,
         }
 
         append_record(record)
@@ -7567,6 +8578,15 @@ def webhook():
 @app.route("/api/history")
 def api_history():
     return jsonify(organize_data())
+
+@app.route("/api/config")
+def api_config():
+    # Do not return secrets (API keys). Only return safe configuration.
+    base = (JELLYFIN_PUBLIC_URL or JELLYFIN_URL or "").rstrip("/")
+    return jsonify({
+        "jellyfin_public_url": base,
+        "jellyfin_configured": True if base else False,
+    })
 
 @app.route("/api/history_sig")
 def api_history_sig():
@@ -7874,26 +8894,70 @@ def api_manual_entry():
         
         if record.get("type") not in ["Movie", "Episode"]:
             return jsonify({"success": False, "error": "Type must be Movie or Episode"}), 400
+
+        # Canonicalize Movie titles via TMDB so casing/format matches TMDB (and posters resolve).
+        if record.get("type") == "Movie":
+            try:
+                raw_title = str(record.get("name") or "").strip()
+                exp_year = _coerce_int(record.get("year"), None)
+                info = get_tmdb_movie_info(raw_title, expected_year=exp_year, allow_network=True)
+                if isinstance(info, dict) and info.get("tmdb_name"):
+                    record["name"] = info.get("tmdb_name") or raw_title
+                    # Only fill year when user didn't provide one.
+                    if record.get("year") in (None, "", 0) and info.get("tmdb_year"):
+                        record["year"] = _coerce_int(info.get("tmdb_year"), None)
+            except Exception:
+                pass
         
         if record.get("type") == "Episode":
             if not record.get("series_name") or record.get("season") is None or record.get("episode") is None:
                 return jsonify({"success": False, "error": "Episodes require series_name, season, and episode"}), 400
-                        # Auto-fill episode title from TMDB if user didn't provide one (or provided a placeholder)
-            try:
-                incoming_name = (record.get("name") or "").strip()
-                ep_num = record.get("episode")
-                needs_title = (not incoming_name) or (incoming_name.lower() == "episode") or (incoming_name.lower().startswith("episode "))
 
-                if needs_title:
-                    tmdb_name = get_tmdb_episode_name(record.get("series_name"), record.get("season"), ep_num)
-                    record["name"] = tmdb_name if tmdb_name else f"Episode {ep_num}"
-            except Exception as e:
-                # Never fail the request due to TMDB lookup issues
-                ep_num = record.get("episode")
-                record["name"] = record.get("name") or f"Episode {ep_num}"    
+            series_name = (record.get("series_name") or "").strip()
+            season = _coerce_int(record.get("season"), None)
+            ep_num = _coerce_int(record.get("episode"), None)
+            if not series_name or season is None or ep_num is None:
+                return jsonify({"success": False, "error": "Episodes require series_name, season, and episode"}), 400
+            record["season"] = season
+            record["episode"] = ep_num
+
+            # Canonicalize series name via TMDB when possible.
+            canonical_series = series_name
+            series_info = None
+            try:
+                series_info = get_tmdb_series_info(series_name, expected_year=record.get("year"))
+                if isinstance(series_info, dict) and series_info.get("tmdb_name"):
+                    canonical_series = series_info.get("tmdb_name") or series_name
+            except Exception:
+                series_info = None
+            record["series_name"] = canonical_series
+            try:
+                if isinstance(series_info, dict):
+                    _update_show_totals_from_tmdb(canonical_series, record.get("year"), series_info)
+            except Exception:
+                pass
+
+            # Prefer TMDB episode title over user-provided casing/title when possible.
+            try:
+                tmdb_name = get_tmdb_episode_name(canonical_series, season, ep_num)
+                record["name"] = tmdb_name if tmdb_name else (record.get("name") or f"Episode {ep_num}")
+            except Exception:
+                record["name"] = record.get("name") or f"Episode {ep_num}"
         
         append_record(record)
         print(f"✓ Manual entry added: {record.get('type')} - {record.get('name')}")
+
+        # Queue TMDB work (posters/totals) for manual adds. /api/history stays cache-only,
+        # so without this you can get placeholders until the next background prewarm.
+        try:
+            rtype = str(record.get("type") or "").strip().lower()
+            if rtype == "movie":
+                _queue_tmdb_poster_fetch(record.get("name"), record.get("year"), "movie")
+            elif rtype == "episode":
+                _queue_tmdb_poster_fetch(record.get("series_name") or record.get("name"), record.get("year"), "tv")
+                _queue_tmdb_series_fetch(record.get("series_name") or record.get("name"), expected_year=None)
+        except Exception:
+            pass
         
         return jsonify({"success": True, "message": "Watch record added successfully"})
     
@@ -7905,7 +8969,7 @@ def api_manual_entry():
 def api_add_episode():
     try:
         data = request.get_json()
-        series_name = data.get("series_name")
+        series_name = (data.get("series_name") or "").strip()
         season = data.get("season")
         episode = data.get("episode")
         date = data.get("date")
@@ -7913,20 +8977,36 @@ def api_add_episode():
         
         if not all([series_name, season is not None, episode is not None, date]):
             return jsonify({"success": False, "error": "Missing required fields"}), 400
+
+        canonical_series = series_name
+        series_info = None
+        if TMDB_API_KEY and not skip_tmdb:
+            try:
+                series_info = get_tmdb_series_info(series_name)
+                if isinstance(series_info, dict) and series_info.get("tmdb_name"):
+                    canonical_series = series_info.get("tmdb_name") or series_name
+            except Exception:
+                series_info = None
         
         if not skip_tmdb:
-            episode_name = get_tmdb_episode_name(series_name, season, episode)
+            episode_name = get_tmdb_episode_name(canonical_series, season, episode)
             if not episode_name:
                 episode_name = f"Episode {episode}"
         else:
             episode_name = f"Episode {episode}"
+
+        try:
+            if isinstance(series_info, dict):
+                _update_show_totals_from_tmdb(canonical_series, None, series_info)
+        except Exception:
+            pass
         
         record = {
             "timestamp": datetime.fromisoformat(date + "T12:00:00").isoformat(),
             "type": "Episode",
             "name": episode_name,
             "year": None,
-            "series_name": series_name,
+            "series_name": canonical_series,
             "season": season,
             "episode": episode,
             "user": "Manual Entry",
@@ -7935,9 +9015,16 @@ def api_add_episode():
         }
         
         append_record(record)
-        print(f"✓ Added episode: {series_name} S{season}E{episode} - {episode_name}")
+        print(f"✓ Added episode: {canonical_series} S{season}E{episode} - {episode_name}")
+
+        # Queue poster + totals fetch for this show.
+        try:
+            _queue_tmdb_poster_fetch(canonical_series, None, "tv")
+            _queue_tmdb_series_fetch(canonical_series, expected_year=None)
+        except Exception:
+            pass
         
-        return jsonify({"success": True, "episode_name": episode_name})
+        return jsonify({"success": True, "series_name": canonical_series, "episode_name": episode_name})
     
     except Exception as e:
         print(f"✗ Add episode error: {e}")
@@ -7949,7 +9036,7 @@ def api_add_episode():
 def api_add_season():
     try:
         data = request.get_json()
-        series_name = data.get("series_name")
+        series_name = (data.get("series_name") or "").strip()
         season = data.get("season")
         date = data.get("date")
         skip_tmdb = data.get("skip_tmdb", False)
@@ -7957,9 +9044,19 @@ def api_add_season():
         
         if not all([series_name, season is not None, date]):
             return jsonify({"success": False, "error": "Missing required fields"}), 400
+
+        canonical_series = series_name
+        series_info = None
+        if TMDB_API_KEY and not skip_tmdb:
+            try:
+                series_info = get_tmdb_series_info(series_name)
+                if isinstance(series_info, dict) and series_info.get("tmdb_name"):
+                    canonical_series = series_info.get("tmdb_name") or series_name
+            except Exception:
+                series_info = None
         
         if not skip_tmdb:
-            episodes = get_tmdb_season_episodes(series_name, season)
+            episodes = get_tmdb_season_episodes(canonical_series, season)
             
             if not episodes or len(episodes) == 0:
                 if episode_count:
@@ -7970,6 +9067,12 @@ def api_add_season():
             if not episode_count:
                 return jsonify({"success": False, "error": "Episode count required when skipping TMDB"}), 400
             episodes = [{"episode_number": i, "name": f"Episode {i}"} for i in range(1, episode_count + 1)]
+
+        try:
+            if isinstance(series_info, dict):
+                _update_show_totals_from_tmdb(canonical_series, None, series_info)
+        except Exception:
+            pass
         
         count = 0
         for ep in episodes:
@@ -7978,7 +9081,7 @@ def api_add_season():
                 "type": "Episode",
                 "name": ep["name"],
                 "year": None,
-                "series_name": series_name,
+                "series_name": canonical_series,
                 "season": season,
                 "episode": ep["episode_number"],
                 "user": "Manual Entry",
@@ -7988,9 +9091,16 @@ def api_add_season():
             append_record(record)
             count += 1
         
-        print(f"✓ Added season: {series_name} S{season} - {count} episodes")
+        print(f"✓ Added season: {canonical_series} S{season} - {count} episodes")
+
+        # Queue poster + totals fetch for this show.
+        try:
+            _queue_tmdb_poster_fetch(canonical_series, None, "tv")
+            _queue_tmdb_series_fetch(canonical_series, expected_year=None)
+        except Exception:
+            pass
         
-        return jsonify({"success": True, "count": count})
+        return jsonify({"success": True, "series_name": canonical_series, "count": count})
     
     except Exception as e:
         print(f"✗ Add season error: {e}")
@@ -8037,8 +9147,22 @@ def api_manual_tv_bulk():
         series_name = (payload.get("series_name") or "").strip()
         season = payload.get("season")
         episode_spec = (payload.get("episode_spec") or "").strip()
+        episode_name_override = (payload.get("episode_name") or "").strip()
+        year = _coerce_int(payload.get("year"), None)
+        raw_genres = payload.get("genres", [])
         date = (payload.get("date") or "").strip()
         skip_tmdb = bool(payload.get("skip_tmdb", False))
+
+        # Normalize genres input (accept list or comma-separated string).
+        genres = []
+        try:
+            if isinstance(raw_genres, str):
+                genres = [g.strip() for g in raw_genres.split(",") if g.strip()]
+            elif isinstance(raw_genres, list):
+                genres = [str(g).strip() for g in raw_genres if str(g).strip()]
+        except Exception:
+            genres = []
+        genres = _normalize_genres(genres)
 
         if not series_name:
             return jsonify({"success": False, "error": "Missing series name"}), 400
@@ -8057,19 +9181,27 @@ def api_manual_tv_bulk():
 
         # Build list of (season, episode, name)
         to_add = []
+        canonical_series = series_name
+        series_info = None
 
         if season is None:
             # ALL seasons + ALL episodes
             if skip_tmdb:
                 return jsonify({"success": False, "error": "Cannot fetch all seasons when Skip TMDB is enabled"}), 400
 
-            info = get_tmdb_series_info(series_name)
-            if not info or not info.get("seasons"):
+            series_info = get_tmdb_series_info(series_name, expected_year=year)
+            if not series_info or not series_info.get("seasons"):
                 return jsonify({"success": False, "error": "TMDB could not find this series"}), 400
+            if series_info.get("tmdb_name"):
+                canonical_series = series_info.get("tmdb_name") or series_name
+            try:
+                _update_show_totals_from_tmdb(canonical_series, year, series_info)
+            except Exception:
+                pass
 
             # Iterate seasons in TMDB info (season_number > 0 already in your cache builder)
-            for snum in sorted(info["seasons"].keys()):
-                eps = get_tmdb_season_episodes(series_name, snum)
+            for snum in sorted(series_info["seasons"].keys()):
+                eps = get_tmdb_season_episodes(canonical_series, snum)
                 if not eps:
                     continue
                 for ep in eps:
@@ -8079,21 +9211,42 @@ def api_manual_tv_bulk():
 
         else:
             # Season is provided
+            if TMDB_API_KEY and not skip_tmdb:
+                try:
+                    series_info = get_tmdb_series_info(series_name, expected_year=year)
+                    if isinstance(series_info, dict) and series_info.get("tmdb_name"):
+                        canonical_series = series_info.get("tmdb_name") or series_name
+                    if isinstance(series_info, dict):
+                        _update_show_totals_from_tmdb(canonical_series, year, series_info)
+                except Exception:
+                    series_info = None
+
             if episodes_list:
                 # Specific episodes in season
                 if skip_tmdb:
                     for epno in episodes_list:
                         to_add.append((season, epno, f"Episode {epno}"))
                 else:
+                    eps = get_tmdb_season_episodes(canonical_series, season) or []
+                    ep_map = {}
+                    try:
+                        for ep in eps:
+                            epno = _coerce_int(ep.get("episode_number"), 0) or 0
+                            if epno > 0 and ep.get("name"):
+                                ep_map[epno] = ep.get("name")
+                    except Exception:
+                        ep_map = {}
                     for epno in episodes_list:
-                        nm = get_tmdb_episode_name(series_name, season, epno) or f"Episode {epno}"
+                        nm = ep_map.get(epno) or f"Episode {epno}"
+                        if (not ep_map.get(epno)) and episode_name_override and len(episodes_list) == 1:
+                            nm = episode_name_override
                         to_add.append((season, epno, nm))
             else:
                 # ALL episodes in that season
                 if skip_tmdb:
                     return jsonify({"success": False, "error": "Skip TMDB needs an episode list (e.g. 1,2,5-8)"}), 400
 
-                eps = get_tmdb_season_episodes(series_name, season)
+                eps = get_tmdb_season_episodes(canonical_series, season)
                 if not eps:
                     return jsonify({"success": False, "error": "TMDB could not fetch episodes for that season"}), 400
                 for ep in eps:
@@ -8112,18 +9265,25 @@ def api_manual_tv_bulk():
                 "timestamp": ts,
                 "type": "Episode",
                 "name": nm,
-                "year": None,
-                "series_name": series_name,
+                "year": year,
+                "series_name": canonical_series,
                 "season": int(snum),
                 "episode": int(epno),
                 "user": "Manual Entry",
-                "genres": [],
+                "genres": genres,
                 "source": "manual_bulk_tv"
             }
             append_record(record)
             added += 1
 
-        return jsonify({"success": True, "added": added})
+        # Queue poster + totals fetch for this show.
+        try:
+            _queue_tmdb_poster_fetch(canonical_series, year, "tv")
+            _queue_tmdb_series_fetch(canonical_series, expected_year=year)
+        except Exception:
+            pass
+
+        return jsonify({"success": True, "series_name": canonical_series, "added": added})
 
     except Exception as e:
         traceback.print_exc()
@@ -8227,6 +9387,33 @@ def api_clear_tmdb_cache():
         return jsonify({"success": True})
     
     except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+# ---------------------------------------------------------------------------
+# API: Manually set total episode count for a show
+#
+# This is used when TMDB matching fails for a title and the UI shows
+# "watched/? (fetching TMDB totals...)". It persists the provided total in
+# SHOW_TOTALS_FILE (with tolerant aliases) so the UI can show watched/total.
+@app.route("/api/set_show_total", methods=["POST"])
+def api_set_show_total():
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+        series_name = (data.get("series_name") or "").strip()
+        total = _coerce_int(data.get("total"), 0) or 0
+        if not series_name or total <= 0:
+            return jsonify({"success": False, "error": "Missing series_name or invalid total"}), 400
+
+        # Reuse the same persistence logic as TMDB results.
+        _update_show_totals_from_tmdb(series_name, None, {"total_episodes_in_series": total, "seasons": {}})
+
+        # Ensure the organized cache is invalidated and clients refresh immediately.
+        _touch_tmdb_cache_and_notify()
+        return jsonify({"success": True})
+    except Exception as e:
+        print(f"✗ set_show_total error: {e}")
+        traceback.print_exc()
         return jsonify({"success": False, "error": str(e)}), 500
 
 
@@ -8710,6 +9897,103 @@ def api_jellyfin_import():
     ok, msg, count = jellyfin_import()
     return jsonify({"success": ok, "message": msg if ok else None, "error": None if ok else msg, "imported": count})
 
+@app.route("/api/jellyfin_poll_now", methods=["GET", "POST"])
+def api_jellyfin_poll_now():
+    """
+    Debug/utility endpoint: run the Jellyfin poll sync once and report how many
+    records were appended. Useful when webhooks are missed (autoplay/credits skip).
+    """
+    try:
+        if not JELLYFIN_POLL_ENABLED:
+            return jsonify({
+                "success": False,
+                "error": "Jellyfin polling is disabled (set JELLYFIN_POLL_ENABLED=true to enable).",
+                "config": {
+                    "enabled": bool(JELLYFIN_POLL_ENABLED),
+                    "interval_s": int(JELLYFIN_POLL_INTERVAL_S or 0),
+                    "limit": int(JELLYFIN_POLL_LIMIT or 0),
+                    "has_url": bool(JELLYFIN_URL),
+                    "has_api_key": bool(JELLYFIN_API_KEY),
+                },
+            }), 400
+        if not JELLYFIN_URL:
+            return jsonify({
+                "success": False,
+                "error": "JELLYFIN_URL is not set.",
+                "config": {
+                    "enabled": bool(JELLYFIN_POLL_ENABLED),
+                    "interval_s": int(JELLYFIN_POLL_INTERVAL_S or 0),
+                    "limit": int(JELLYFIN_POLL_LIMIT or 0),
+                    "has_url": bool(JELLYFIN_URL),
+                    "has_api_key": bool(JELLYFIN_API_KEY),
+                },
+            }), 400
+        if not JELLYFIN_API_KEY:
+            return jsonify({
+                "success": False,
+                "error": "JELLYFIN_API_KEY is not set.",
+                "config": {
+                    "enabled": bool(JELLYFIN_POLL_ENABLED),
+                    "interval_s": int(JELLYFIN_POLL_INTERVAL_S or 0),
+                    "limit": int(JELLYFIN_POLL_LIMIT or 0),
+                    "has_url": bool(JELLYFIN_URL),
+                    "has_api_key": bool(JELLYFIN_API_KEY),
+                },
+            }), 400
+
+        added = jellyfin_poll_sync_once()
+        state = load_json_file(JELLYFIN_POLL_STATE_FILE)
+        # Include a small "peek" so users can confirm Jellyfin is returning played items.
+        peek = []
+        try:
+            headers = {"X-Emby-Token": JELLYFIN_API_KEY}
+            uid = (state or {}).get("user_id")
+            if uid:
+                params = {
+                    "Filters": "IsPlayed",
+                    "Recursive": "true",
+                    "Fields": "Genres,UserData",
+                    "IncludeItemTypes": "Movie,Episode",
+                    "StartIndex": 0,
+                    "Limit": 10,
+                    "SortBy": "DatePlayed",
+                    "SortOrder": "Descending",
+                }
+                r2 = requests.get(f"{JELLYFIN_URL}/Users/{uid}/Items", headers=headers, params=params, timeout=20)
+                if r2.status_code == 200:
+                    page = r2.json() or {}
+                    for it in (page.get("Items", []) or [])[:10]:
+                        lp = (it.get("UserData") or {}).get("LastPlayedDate")
+                        peek.append({
+                            "id": it.get("Id"),
+                            "type": it.get("Type"),
+                            "name": it.get("Name"),
+                            "series_name": it.get("SeriesName"),
+                            "season": it.get("ParentIndexNumber"),
+                            "episode": it.get("IndexNumber"),
+                            "last_played": lp,
+                            "last_played_epoch": _parse_iso_to_epoch_seconds(lp),
+                        })
+        except Exception:
+            peek = []
+
+        return jsonify({
+            "success": True,
+            "added": int(added or 0),
+            "state": state,
+            "peek": peek,
+            "config": {
+                "enabled": bool(JELLYFIN_POLL_ENABLED),
+                "interval_s": int(JELLYFIN_POLL_INTERVAL_S or 0),
+                "limit": int(JELLYFIN_POLL_LIMIT or 0),
+                "lookback_s": int(JELLYFIN_POLL_LOOKBACK_S or 0),
+                "has_url": bool(JELLYFIN_URL),
+                "has_api_key": bool(JELLYFIN_API_KEY),
+            },
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
 
 @app.route("/api/sonarr_import", methods=["POST"])
 def api_sonarr_import():
@@ -8840,6 +10124,9 @@ if __name__ == "__main__":
     refresh_history_sig_fast()
     # Rebuild posters/series totals in the background on startup.
     prewarm_tmdb_cache_async()
+    # Poll Jellyfin for newly played items as a safety net when webhooks are missed
+    # (e.g. autoplay "Next episode" flows).
+    start_jellyfin_poll_thread()
     
     print("=" * 60)
     print("JELLYFIN WATCH TRACKER - VERSION 35")
